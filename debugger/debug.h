@@ -33,8 +33,8 @@ class Expression {
 		int varId;
 		int globalsCount;
 		int start;
-		int end;
 		int instructionAddress;
+		size_t instructionsCount;
 
 		int refCount = 0;
 
@@ -45,38 +45,35 @@ class Expression {
 			this->varId = varId;
 			this->globalsCount = 0;
 			this->start = -1;
-			this->end = -1;
 			this->instructionAddress = -1;
+			this->instructionsCount = 0;
 		}
 
-		Expression(std::string str, DWORD datatype, Script* script, int globalsCount, int start, int end, int instructionAddress) {
+		Expression(std::string str, DWORD datatype, Script* script, int globalsCount, int start, size_t instructionsCount, int instructionAddress) {
 			this->str = str;
 			this->datatype = datatype;
 			this->script = script;
 			this->varId = -1;
 			this->globalsCount = globalsCount;
 			this->start = start;
-			this->end = end;
 			this->instructionAddress = instructionAddress;
+			this->instructionsCount = instructionsCount;
 		}
 
 		size_t getSize() {
-			size_t size = sizeof(Expression);
-			if (start >= 0) {
-				size += end - start;
-			}
-			return size;
-		}
-
-		size_t getInstructionsCount() {
-			return end - start;
+			return sizeof(Expression) + instructionsCount * sizeof(Instruction);
 		}
 };
 
+Var* evalExpression(Task* context, Expression* expr);
+
 class Watch {
+	private:
+		Expression* expression;
+		bool enabled = true;
+
 	public:
 		Task* task;
-		Expression* expression;
 		float oldValue = 0.0;
 		float newValue = 0.0;
 		bool matched = false;
@@ -97,11 +94,36 @@ class Watch {
 			}
 			return "{" + std::to_string(task->taskNumber) + "} ";
 		}
+
+		bool isEnabled() {
+			return this->enabled;
+		}
+
+		void setEnabled(bool enabled) {
+			if (enabled) {
+				if (!this->enabled) {
+					this->enabled = enabled;
+					Var* val = evalExpression(this->task, this->expression);
+					if (val != NULL) {
+						this->oldValue = val->floatVal;
+						this->newValue = val->floatVal;
+					}
+					matched = false;
+				}
+			} else {
+				this->enabled = false;
+			}
+		}
+
+		Expression* getExpression() {
+			return this->expression;
+		}
 };
 
 class Breakpoint {
 	private:
 		Expression* condition = NULL;
+		bool enabled = true;
 
 	public:
 		std::string filename;
@@ -110,7 +132,6 @@ class Breakpoint {
 		DWORD ip;
 		DWORD targetHitCount = 0;
 		DWORD hits = 0;
-		bool enabled = true;
 		bool triggerPoint = false;
 		bool disabledByTrigger = false;
 		bool deleteOnHit = false;
@@ -130,10 +151,20 @@ class Breakpoint {
 			this->setCondition(NULL);
 		}
 
-		void enable() {
-			this->hits = 0;
-			this->enabled = true;
-			this->disabledByTrigger = false;
+		bool isEnabled() {
+			return this->enabled;
+		}
+
+		void setEnabled(bool enabled) {
+			if (enabled) {
+				if (!this->enabled) {
+					this->hits = 0;
+					this->enabled = true;
+					this->disabledByTrigger = false;
+				}
+			} else {
+				this->enabled = false;
+			}
 		}
 
 		void setCondition(Expression* expr) {
@@ -183,6 +214,8 @@ bool varIsGlobal(Var* var);
 bool varIsLocal(Var* var, Task* task);
 bool varIsArray(Task* task, Var* var);
 int getVarSize(Task* task, Var* var);
+
+int declareGlobalVar(const char* name);
 
 Task* getInnermostFrame(Task* task);
 int getFrameDepth(Task* task);
@@ -251,7 +284,7 @@ extern ScriptLibraryRDll ScriptLibraryR;
 extern std::set<std::string> sourcePath;
 extern Task* steppingThread;
 extern Task* catchThread;
-extern bool catchSysCalls[];
+extern BYTE catchSysCalls[];
 extern DWORD breakFromAddress;
 extern int breakAfterLines;
 extern int breakAfterInstructions;
@@ -264,6 +297,7 @@ extern std::map<DWORD, std::string> scriptType_names;
 
 extern const char* datatype_names[8];
 extern char datatype_chars[8];
+extern const char* vartype_names[4];
 
 extern std::vector<std::string> opcode_keywords[45][3];
 extern DWORD opcode_attrs[45];
@@ -277,3 +311,7 @@ constexpr auto OP_ATTR_VSTACK	= 32;
 
 extern const char* NativeFunctions[];
 constexpr auto NATIVE_COUNT = 528;
+
+constexpr auto NOT_SET = 0;
+constexpr auto ENABLED = 1;
+constexpr auto DISABLED = 2;

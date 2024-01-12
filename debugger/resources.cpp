@@ -12,6 +12,10 @@ char datatype_chars[8] = {
 	'n', 'i', 'f', 'c', 'o', 'u', 'b', 'v'
 };
 
+const char* vartype_names[4] = {
+	NULL, "reference", "array", "atomic"
+};
+
 std::map<DWORD, std::string> scriptType_names = {
 	{1, "script"},
 	{2, "help script"},

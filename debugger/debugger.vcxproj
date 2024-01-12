@@ -113,6 +113,7 @@
       <PrecompiledHeaderOutputFile />
       <AdditionalIncludeDirectories>C:\Users\Daniele\Documents\Detours\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <InlineFunctionExpansion>Default</InlineFunctionExpansion>
+      <DisableSpecificWarnings>26812;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>

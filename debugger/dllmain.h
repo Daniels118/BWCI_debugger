@@ -17,6 +17,10 @@ class Segment {
 			this->address = address;
 			this->size = size;
 		}
+
+		int getEnd() {
+			return address + size;
+		}
 };
 
 class MemoryManager {
@@ -24,7 +28,7 @@ class MemoryManager {
 		std::list<Segment> freeSegments;
 
 	public:
-		bool addFreeSpace(int address, int size) {
+		bool addFreeSpace(const int address, const int size) {
 			if (freeSegments.empty()) {
 				TRACE("adding segment %i -> %i", address, address + size);
 				freeSegments.push_front(Segment(address, size));
@@ -63,35 +67,35 @@ class MemoryManager {
 			return true;
 		}
 
-		int getFreeSpace(int size) {
+		int getFreeSpace(const int size) {
 			for (auto pos = freeSegments.begin(); pos != freeSegments.end(); ++pos) {
 				Segment segment = *pos;
 				if (segment.size == size) {
-					int address = segment.address;
+					const int address = segment.address;
 					freeSegments.erase(pos);
 					return address;
 				} else if (segment.size > size) {
-					int address = segment.address;
-					segment.address += size;
-					segment.size -= size;
+					const int address = segment.address;
+					segment.address += size;		//Shift the free segment forward...
+					segment.size -= size;			//... and shrink it
 					return address;
 				}
 			}
 			return -1;
 		}
 
-		int setTotalSize(int newSize) {
-			for (auto pos = freeSegments.begin(); pos != freeSegments.end(); ++pos) {
-				Segment segment = *pos;
-				if (segment.address + segment.size >= newSize) {
-					int shrinkTo = segment.address;
-					for (; pos != freeSegments.end(); ++pos) {
-						freeSegments.erase(pos);
+		int setTotalSize(int size) {
+			if (!freeSegments.empty() && freeSegments.back().getEnd() >= size) {
+				for (auto pos = freeSegments.begin(); pos != freeSegments.end(); ++pos) {
+					Segment segment = *pos;
+					if (segment.address + segment.size >= size) {
+						size = segment.address;							//Size can be reduced to the beginning of this segment
+						freeSegments.erase(pos, freeSegments.end());	//Delete all free segments past new size
+						break;
 					}
-					return shrinkTo;
 				}
 			}
-			return newSize;
+			return size;
 		}
 
 		void printSegments() {

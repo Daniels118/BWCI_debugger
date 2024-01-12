@@ -32,7 +32,7 @@ class Gdb : public Debugger {
 		static char buffer[BUFFER_SIZE];
 		static char* argv[MAX_ARGS];
 
-		static std::queue<std::string> commandQueue;
+		static std::list<std::string> commandQueue;
 
 		static Breakpoint* lastHitBreakpoint;
 
@@ -49,6 +49,12 @@ class Gdb : public Debugger {
 		static std::map<std::string, UserCommand> userCommands;
 
 		static int maxPrintElements;
+		static bool echo_on;
+
+		static const int BLOCK = 1;
+		static const int LOOP = 2;
+		static std::vector<int> blocks;
+		static int inScript;
 
 	public:
 		Gdb() {
@@ -57,7 +63,7 @@ class Gdb : public Debugger {
 			int argc = splitArgs(buffer, ' ', argv, MAX_ARGS);
 			char* script = getArgVal(argv, argc, "/gdb:script");
 			if (script != NULL) {
-				commandQueue.push("source " + std::string(script));
+				commandQueue.push_back("source " + std::string(script));
 			}
 		}
 
@@ -113,7 +119,7 @@ class Gdb : public Debugger {
 			}
 			currentFrame = task;
 			for (std::string cmd : breakpoint->commands) {
-				commandQueue.push(cmd);
+				commandQueue.push_back(cmd);
 			}
 			printDisplays(task);
 			printCurrentLine(task);
@@ -161,7 +167,7 @@ class Gdb : public Debugger {
 			for (Watch* watch : watches) {
 				printf("Old value = %f\n", watch->oldValue);
 				printf("New value = %f\n", watch->newValue);
-				printf("Watchpoint: %s\n", watch->expression->str.c_str());
+				printf("Watchpoint: %s\n", watch->getExpression()->str.c_str());
 			}
 			if (exception) {
 				printf("Exception in Thread %i\n", catchThread->taskNumber);
@@ -186,9 +192,7 @@ class Gdb : public Debugger {
 			switch (fdwCtrlType) {
 			case CTRL_C_EVENT:
 				if (!commandQueue.empty()) {
-					while (!commandQueue.empty()) {
-						commandQueue.pop();
-					}
+					commandQueue.clear();
 					printf("\nScript execution interrupted.\n");
 				}
 				printf("\nPaused.\n");
@@ -298,7 +302,7 @@ class Gdb : public Debugger {
 		}
 
 		static bool prompt(const char* format, ...) {
-			if (commandQueue.empty()) {
+			if (echo_on || commandQueue.empty()) {
 				va_list args;
 				va_start(args, format);
 				vprintf(format, args);
@@ -315,9 +319,11 @@ class Gdb : public Debugger {
 				}
 			} else {
 				std::string cmd = commandQueue.front();
-				commandQueue.pop();
+				commandQueue.pop_front();
 				strcpy(buffer, cmd.c_str());
-				//printf("%s\n", buffer);		//Echo ON
+				if (echo_on) {
+					printf("%s\n", buffer);
+				}
 				return true;
 			}
 			return false;
@@ -336,6 +342,13 @@ class Gdb : public Debugger {
 					break;
 				}
 			}
+		}
+
+		static const char* ltrim(const char* str) {
+			while (*str != 0 && (*str == ' ' || *str == '\t')) {
+				str++;
+			}
+			return str;
 		}
 
 		static bool inArray(const int value, char** argv, int argc) {
@@ -424,16 +437,18 @@ class Gdb : public Debugger {
 					datatype = DT_FLOAT;
 				} else if (streq(format, "/d")) {
 					datatype = DT_INT;
+				} else if (streq(format, "/c")) {
+					datatype = DT_COORDS;
 				} else if (streq(format, "/b")) {
 					datatype = DT_BOOLEAN;
 				} else {
-					printf("Invalid format. Valid formats are /f, /d and /b.\n");
+					printf("Invalid format. Valid formats are /f, /d, /c and /b.\n");
 					return;
 				}
 			}
 			expression = rawBuffer + (expression - buffer);
 			//rejoinArgs(argv, argc, expression, NULL);
-			Var* result = getVar(currentFrame, expression);
+			Var* result = datatype == DT_COORDS ? NULL : getVar(currentFrame, expression);
 			if (result != NULL) {
 				datatype = varIsArray(currentFrame, result) ? DT_ARRAY : DT_FLOAT;
 			} else {
@@ -446,6 +461,8 @@ class Gdb : public Debugger {
 					printf("%s%i%s", prefix, (int)result->floatVal, suffix);
 				} else if (datatype == DT_BOOLEAN) {
 					printf("%s%s%s", prefix, result->floatVal != 0.0 ? "true" : "false", suffix);
+				} else if (datatype == DT_COORDS) {
+					printf("%s[%f, %f, %f]%s", prefix, result[0].floatVal, result[1].floatVal, result[2].floatVal, suffix);
 				} else if (datatype == DT_ARRAY) {
 					const int count = getVarSize(currentFrame, result);
 					printf("%s{%f", prefix, result->floatVal);
@@ -468,8 +485,8 @@ class Gdb : public Debugger {
 			char rawBuffer[BUFFER_SIZE];
 			strcpy(rawBuffer, buffer);
 			int argc = splitArgs(buffer, ' ', argv, MAX_ARGS);
-			char* cmd = argv[0];
-			if (strlen(cmd) == 0) {
+			const char* cmd = ltrim(argv[0]);
+			if (streq(cmd, "") || cmd[0] == '#') {
 				return false;
 			//################################################################################################## ADVANCE
 			} else if (streq(cmd, "advance")) {
@@ -669,7 +686,7 @@ class Gdb : public Debugger {
 							arg = argv[j];
 							for (int i = 0; i < NATIVE_COUNT; i++) {
 								if (streq(arg, NativeFunctions[i])) {
-									catchSysCalls[i] = true;
+									catchSysCalls[i] = ENABLED;
 								}
 							}
 						}
@@ -918,15 +935,19 @@ class Gdb : public Debugger {
 							deleteWatch(watch);
 						} else {
 							index -= watches.size();
-							for (int i = 0; i < NATIVE_COUNT; i++) {
-								if (catchSysCalls[i]) {
-									if (index-- == 0) {
-										catchSysCalls[i] = false;
+							if (catchThread != NULL && index-- == 0) {
+								catchThread = NULL;
+							} else {
+								for (int i = 0; i < NATIVE_COUNT; i++) {
+									if (catchSysCalls[i]) {
+										if (index-- == 0) {
+											catchSysCalls[i] = NOT_SET;
+										}
 									}
 								}
-							}
-							if (index >= 0) {
-								printf("Breakpoint not found\n");
+								if (index >= 0) {
+									printf("Breakpoint not found\n");
+								}
 							}
 						}
 					}
@@ -1028,7 +1049,7 @@ class Gdb : public Debugger {
 			} else if (streq(cmd, "disable")) {
 				if (argc == 1) {
 					for (Breakpoint* breakpoint : getBreakpoints()) {
-						breakpoint->enabled = false;
+						breakpoint->setEnabled(false);
 					}
 					return false;
 				} else if (argc == 3 && abbrev(argv[1], "display", 4)) {
@@ -1043,12 +1064,39 @@ class Gdb : public Debugger {
 					}
 					return false;
 				} else {
-					int index = atoi(argv[1]) - 1;
-					Breakpoint* breakpoint = getBreakpointByIndex(index);
-					if (breakpoint != NULL) {
-						breakpoint->enabled = false;
+					int index = atoi(argv[argc - 1]) - 1;
+					if (index < 0) {
+						printf("Invalid index\n");
+						return false;
+					}
+					auto breakpoints = getBreakpoints();
+					if (index < (int)breakpoints.size()) {
+						Breakpoint* breakpoint = getBreakpointByIndex(index);
+						breakpoint->setEnabled(false);
 					} else {
-						printf("Breakpoint not found\n");
+						index -= breakpoints.size();
+						auto watches = getWatches();
+						if (index < (int)watches.size()) {
+							Watch* watch = getWatchByIndex(index);
+							watch->setEnabled(false);
+						} else {
+							index -= watches.size();
+							if (catchThread != NULL && index-- == 0) {
+								printf("Catchpoint for exceptions can't be disabled, please use delete command.\n");
+							} else {
+								for (int i = 0; i < NATIVE_COUNT; i++) {
+									if (catchSysCalls[i]) {
+										if (index-- == 0) {
+											catchSysCalls[i] = DISABLED;
+											break;
+										}
+									}
+								}
+								if (index >= 0) {
+									printf("Breakpoint not found\n");
+								}
+							}
+						}
 					}
 					return false;
 				}
@@ -1120,8 +1168,7 @@ class Gdb : public Debugger {
 			} else if (streq(cmd, "enable")) {
 				if (argc == 1) {
 					for (Breakpoint* breakpoint : getBreakpoints()) {
-						breakpoint->enabled = true;
-						breakpoint->disabledByTrigger = false;
+						breakpoint->setEnabled(true);
 					}
 					return false;
 				} else if (argc == 3 && abbrev(argv[1], "display", 4)) {
@@ -1139,9 +1186,14 @@ class Gdb : public Debugger {
 					bool once = getArgFlag(argv, argc, "once");
 					bool deleteOnHit = getArgFlag(argv, argc, "del");
 					int index = atoi(argv[argc - 1]) - 1;
-					Breakpoint* breakpoint = getBreakpointByIndex(index);
-					if (breakpoint != NULL) {
-						breakpoint->enable();
+					if (index < 0) {
+						printf("Invalid index\n");
+						return false;
+					}
+					auto breakpoints = getBreakpoints();
+					if (index < (int)breakpoints.size()) {
+						Breakpoint* breakpoint = getBreakpointByIndex(index);
+						breakpoint->setEnabled(true);
 						if (once) {
 							breakpoint->targetHitCount = 1;
 						}
@@ -1149,10 +1201,44 @@ class Gdb : public Debugger {
 							breakpoint->deleteOnHit = true;
 						}
 					} else {
-						printf("Breakpoint not found\n");
+						index -= breakpoints.size();
+						auto watches = getWatches();
+						if (index < (int)watches.size()) {
+							Watch* watch = getWatchByIndex(index);
+							watch->setEnabled(true);
+						} else {
+							index -= watches.size();
+							if (catchThread != NULL && index-- == 0) {
+								//can't be disabled, just deleted
+							} else {
+								for (int i = 0; i < NATIVE_COUNT; i++) {
+									if (catchSysCalls[i]) {
+										if (index-- == 0) {
+											catchSysCalls[i] = ENABLED;
+											break;
+										}
+									}
+								}
+								if (index >= 0) {
+									printf("Breakpoint not found\n");
+								}
+							}
+						}
 					}
 					return false;
 				}
+			//################################################################################################## END
+			} else if (streq(cmd, "end") && inScript > 0) {
+				if (blocks.empty()) {
+					printf("'end' unexpected.\n");
+				} else {
+					blocks.pop_back();
+				}
+				return false;
+			//################################################################################################## END_OF_SCRIPT
+			} else if (streq(cmd, "end_of_script") && inScript > 0) {
+				inScript--;
+				return false;
 			//################################################################################################## EVAL
 			} else if (streq(cmd, "eval")) {
 				if (argc >= 2) {
@@ -1162,7 +1248,7 @@ class Gdb : public Debugger {
 					char line[1024];
 					int len = usprintf(line, argv[0], argc - 1, argv + 1);
 					if (len > 0) {
-						commandQueue.push(line);
+						commandQueue.push_front(line);
 					}
 					return false;
 				}
@@ -1205,6 +1291,41 @@ class Gdb : public Debugger {
 					}
 				}
 				return false;
+			//################################################################################################## IF
+			} else if (streq(cmd, "if") && inScript > 0) {
+				if (argc >= 2) {
+					blocks.push_back(BLOCK);
+					char* sCond = rawBuffer + (argv[1] - buffer);
+					int datatype = DT_BOOLEAN;
+					Script* script = getTaskScript(currentFrame);
+					Expression* cond = getCompiledExpression(script, sCond, datatype);
+					if (cond != NULL) {
+						std::list<std::string> lines;
+						Var* condRes = evalExpression(currentFrame, cond);
+						bool condVal = condRes != NULL && condRes->floatVal != 0;
+						bool inThen = true;
+						int depth = 1;
+						while (true) {
+							prompt(">");
+							const char* cmd2 = ltrim(buffer);
+							if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+								depth++;
+							} else if (depth == 1 && streq(cmd2, "else")) {
+								inThen = false;
+								continue;
+							} else if (streq(cmd2, "end")) {
+								depth--;
+								if (depth == 0) break;
+							}
+							if (condVal == inThen) {
+								lines.push_back(buffer);
+							}
+						}
+						lines.push_back("end");
+						commandQueue.insert(commandQueue.begin(), lines.begin(), lines.end());
+					}
+					return false;
+				}
 			//################################################################################################## IGNORE
 			} else if (streq(cmd, "ignore")) {
 				if (argc >= 3) {
@@ -1212,7 +1333,7 @@ class Gdb : public Debugger {
 					int count = atoi(argv[2]);
 					Breakpoint* breakpoint = getBreakpointByIndex(index);
 					if (breakpoint != NULL) {
-						breakpoint->enable();
+						breakpoint->setEnabled(true);
 						breakpoint->targetHitCount = count + 1;
 					} else {
 						printf("Breakpoint not found\n");
@@ -1264,21 +1385,26 @@ class Gdb : public Debugger {
 						//  show defined breakpoints
 						int index = 1;
 						for (Breakpoint* breakpoint : getBreakpoints()) {
-							const char* enabled = breakpoint->enabled ? "enabled" : "disabled";
+							const char* enabled = breakpoint->isEnabled() ? "enabled" : "disabled";
 							printf("%5i breakpoint %-8s %8i %s:%i\n", index++, enabled, breakpoint->ip,
 									breakpoint->filename.c_str(), breakpoint->lineno);
 						}
 						for (Watch* watch : getWatches()) {
+							const char* enabled = watch->isEnabled() ? "enabled" : "disabled";
 							if (watch->task == NULL) {
-								printf("%5i watchpoint %-8s %8i %s\n", index++, "enabled", 0, watch->expression->str.c_str());
+								printf("%5i watchpoint %-8s %8i %s\n", index++, enabled, 0, watch->getExpression()->str.c_str());
 							} else {
-								printf("%5i watchpoint %-8s %8i %s (Task %i)\n", index++, "enabled", 0,
-										watch->expression->str.c_str(), watch->task->taskNumber);
+								printf("%5i watchpoint %-8s %8i %s (Task %i)\n", index++, enabled, 0,
+										watch->getExpression()->str.c_str(), watch->task->taskNumber);
 							}
+						}
+						if (catchThread != NULL) {
+							printf("%5i catchpoint %-8s %8i %s (Thread %i)\n", index++, "enabled", 0, "exception", catchThread->taskNumber);
 						}
 						for (int i = 0; i < NATIVE_COUNT; i++) {
 							if (catchSysCalls[i]) {
-								printf("%5i catchpoint %-8s %8i %s\n", index++, "enabled", 0, NativeFunctions[i]);
+								const char* enabled = catchSysCalls[i] == ENABLED ? "enabled" : "disabled";
+								printf("%5i catchpoint %-8s %8i %s\n", index++, enabled, 0, NativeFunctions[i]);
 							}
 						}
 						return false;
@@ -1483,8 +1609,8 @@ class Gdb : public Debugger {
 						if (argc >= 2) {
 							file = argv[0];
 						}
-						first = atoi(argv[argc - 1]);
-						last = first;
+						first = atoi(argv[argc - 1]) - 6;
+						last = first + 9;
 					}
 				}
 				if (file != NULL) {
@@ -1503,6 +1629,78 @@ class Gdb : public Debugger {
 					}
 				} else {
 					printf("File not set\n");
+				}
+				return false;
+			//################################################################################################## LOOP_BREAK
+			} else if (streq(cmd, "loop_break") && inScript > 0) {
+				bool found = false;
+				int rdepth = 1;
+				for (auto it = blocks.rbegin(); it != blocks.rend(); it++, rdepth++) {
+					if (*it == LOOP) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					printf("Not in a loop.\n");
+					return false;
+				}
+				//Remove the running loop
+				while (!commandQueue.empty()) {
+					std::string line = commandQueue.front();
+					commandQueue.pop_front();
+					const char* cmd2 = ltrim(line.c_str());
+					if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+						rdepth++;
+					} else if (streq(cmd2, "end")) {
+						rdepth--;
+						if (rdepth == 0) {
+							blocks.pop_back();
+							break;
+						}
+					}
+				}
+				//Remove the next loop
+				while (!commandQueue.empty()) {
+					std::string line = commandQueue.front();
+					commandQueue.pop_front();
+					const char* cmd2 = ltrim(line.c_str());
+					if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+						rdepth++;
+					} else if (streq(cmd2, "end")) {
+						rdepth--;
+						if (rdepth == 0) break;
+					}
+				}
+				return false;
+			//################################################################################################## LOOP_CONTINUE
+			} else if (streq(cmd, "loop_continue") && inScript > 0) {
+				bool found = false;
+				int rdepth = 1;
+				for (auto it = blocks.rbegin(); it != blocks.rend(); it++, rdepth++) {
+					if (*it == LOOP) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					printf("Not in a loop.\n");
+					return false;
+				}
+				//Remove the running loop
+				while (!commandQueue.empty()) {
+					std::string line = commandQueue.front();
+					commandQueue.pop_front();
+					const char* cmd2 = ltrim(line.c_str());
+					if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+						rdepth++;
+					} else if (streq(cmd2, "end")) {
+						rdepth--;
+						if (rdepth == 0) {
+							blocks.pop_back();
+							break;
+						}
+					}
 				}
 				return false;
 			//################################################################################################## NEXT
@@ -1642,6 +1840,17 @@ class Gdb : public Debugger {
 							}
 							return false;
 						}
+					} else if (streq(type, "echo") && argc == 3) {
+						char* val = argv[2];
+						if (streq(val, "on")) {
+							echo_on = true;
+							printf("echo is on.\n");
+						} else if (streq(val, "off")) {
+							echo_on = false;
+						} else {
+							printf("Expected 'on' or 'off'.\n");
+						}
+						return false;
 					} else {
 						char* sExpr = argv[1];
 						if (streq(type, "var") || streq(type, "variable")) {
@@ -1665,24 +1874,22 @@ class Gdb : public Debugger {
 							} else if (streq(name, "$tks")) {
 								currentFrame->ticks = atoi(sValue);
 							} else {
-								int varId;
+								Var* var;
 								if (strncmp(name, "{int}", 5) == 0) {
-									varId = atoi(name + 5);
-									Var* var = getVarById(currentFrame, varId);
+									int varId = atoi(name + 5);
+									var = getVarById(currentFrame, varId);
 									if (var == NULL) {
 										printf("Invalid variable ID.\n");
 										return false;
 									}
 								} else {
-									Script* script = getTaskScript(currentFrame);
-									varId = getVarId(script, name);
-									if (varId < 0 && name[0] == '_' && currentFrame != NULL) {
-										int gVarId = ScriptLibraryR.createVar(name, 2, NULL, TRUE);
+									var = getVar(currentFrame, name);
+									if (var == NULL && name[0] == '_') {
+										int gVarId = declareGlobalVar(name);
 										printf("Global variable '%s' defined with ID %i\n", name, gVarId);
 									}
 								}
-								if (varId >= 0) {
-									Var* var = getVarById(currentFrame, varId);
+								if (var != NULL) {
 									if (streq(sValue, "true")) {
 										var->floatVal = 1.0;
 									} else if (streq(sValue, "false")) {
@@ -1740,11 +1947,14 @@ class Gdb : public Debugger {
 						if (file == NULL) {
 							printf("Failed to open file '%s'\n", absFilename.c_str());
 						} else {
+							auto it = commandQueue.begin();
 							while (fgets(buffer, BUFFER_SIZE, file)) {
 								buffer[strcspn(buffer, "\r\n")] = 0;
-								commandQueue.push(buffer);
+								commandQueue.insert(it, buffer);
 							}
 							fclose(file);
+							commandQueue.insert(it, "end_of_script");
+							inScript++;
 						}
 					}
 					return false;
@@ -1894,6 +2104,39 @@ class Gdb : public Debugger {
 					}
 					return false;
 				}
+			//################################################################################################## WHILE
+			} else if (streq(cmd, "while") && inScript > 0) {
+				if (argc >= 2) {
+					blocks.push_back(LOOP);
+					char* sCond = rawBuffer + (argv[1] - buffer);
+					int datatype = DT_BOOLEAN;
+					Script* script = getTaskScript(currentFrame);
+					Expression* cond = getCompiledExpression(script, sCond, datatype);
+					if (cond != NULL) {
+						std::list<std::string> lines;
+						int depth = 1;
+						while (depth > 0) {
+							prompt(">");
+							const char* cmd2 = ltrim(buffer);
+							if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+								depth++;
+							} else if (streq(cmd2, "end")) {
+								depth--;
+							}
+							lines.push_back(buffer);
+						}
+						Var* condRes = evalExpression(currentFrame, cond);
+						if (condRes != NULL && condRes->floatVal != 0.0) {	//If condition is true
+							auto it = commandQueue.begin();
+							//Add the instructions to be executed on this iteration
+							commandQueue.insert(it, lines.begin(), lines.end());
+							//Add the while-end block again for the next iteration
+							commandQueue.insert(it, rawBuffer);	//while condition
+							commandQueue.insert(it, lines.begin(), lines.end());
+						}
+					}
+					return false;
+				}
 			//################################################################################################## X
 			} else if (streq(cmd, "x")) {
 				if (argc >= 2) {
@@ -2031,11 +2274,11 @@ class Gdb : public Debugger {
 					for (int i = 1; i < argc; i++) {
 						line = strReplace(line, "$arg"+std::to_string(i - 1), argv[i]);
 					}
-					commandQueue.push(line);
+					commandQueue.push_back(line);
 				}
 				return false;
 			}
-			printf("Invalid command. Enter \"help\" to get a list of available commands.\n");
+			printf("Invalid command '%s'. Enter \"help\" to get a list of available commands.\n", cmd);
 			return false;
 		}
 };
@@ -2043,7 +2286,7 @@ class Gdb : public Debugger {
 char Gdb::buffer[BUFFER_SIZE];
 char* Gdb::argv[MAX_ARGS];
 
-std::queue<std::string> Gdb::commandQueue = std::queue<std::string>();
+std::list<std::string> Gdb::commandQueue = std::list<std::string>();
 
 Breakpoint* Gdb::lastHitBreakpoint;
 
@@ -2060,3 +2303,7 @@ std::list<Display*> Gdb::displays = std::list<Display*>();
 std::map<std::string, UserCommand> Gdb::userCommands = std::map<std::string, UserCommand>();
 
 int Gdb::maxPrintElements = 200;
+bool Gdb::echo_on = false;
+
+std::vector<int> Gdb::blocks = std::vector<int>();
+int Gdb::inScript = 0;

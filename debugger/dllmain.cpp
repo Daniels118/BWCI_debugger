@@ -25,7 +25,7 @@
 #undef LOG_LEVEL
 #undef PAUSE_ON
 #define LOG_LEVEL LL_INFO
-//#define PAUSE_ON LL_TRACE
+//#define PAUSE_ON LL_ERROR
 #include "logger.h"
 
 ScriptLibraryRDll ScriptLibraryR;
@@ -38,7 +38,7 @@ std::map<std::string, Watch*> watches;
 DWORD lastBreakLine;
 Task* steppingThread = NULL;
 Task* catchThread = NULL;
-bool catchSysCalls[NATIVE_COUNT];
+BYTE catchSysCalls[NATIVE_COUNT];
 DWORD breakFromAddress = 0;
 int breakAfterLines = 0;
 int breakAfterInstructions = 0;
@@ -59,16 +59,16 @@ Task* caller = NULL;
 MemoryManager memoryManager;
 
 std::unordered_map<int, std::unordered_map<std::string, Expression*>> expressionsCache;
+size_t unusedExpressionsSize = 0;
+constexpr auto MAX_UNUSED_EXPRESSIONS_BYTES = 4096;
 
 ErrorCallback originalErrCallback = NULL;
 std::stack<ParserMessages*> parseMessagesTraps;
 std::string parseTempFile = "";
 
-int maxLocalVars = 64;
-Var* localVarsCopy = (Var*)malloc(sizeof(Var) + maxLocalVars);
-
 int allowedThreadId = 0;
 
+Var resultVar;
 
 int __cdecl errorCallback(DWORD severity, const char* msg);
 int getScriptSize(Script* script);
@@ -520,6 +520,9 @@ int getVarId(Script* script, const char* name) {
 		if (id < -1) return id;	//pass error codes too (i.e. -2 = index out of bounds)
 	}
 	int id = getGlobalVarId(name0, index);
+	if (script != NULL && id > (int)script->globalsCount) {
+		return -1;
+	}
 	if (id >= 0) {
 		TRACE("variable '%s' resolved with global ID %i", name, id);
 	}
@@ -623,6 +626,12 @@ Var* getGlobalVar(const char* name) {
 	return NULL;
 }
 
+int declareGlobalVar(const char* name) {
+	const int id = ScriptLibraryR.createVar(name, DT_FLOAT, NULL, TRUE);
+	ScriptLibraryR.setVarType(VAR_TYPE_ATOMIC, id);
+	return id;
+}
+
 Task* getInnermostFrame(Task* task) {
 	while (task->waitingTask != 0) {
 		task = getTaskById(task->waitingTask);
@@ -722,9 +731,9 @@ void initVarTypes() {
 		Var& var = ScriptLibraryR.globalVars->pFirst[id];
 		if (!streq(var.name, "LHVMA")) {
 			bool isArray = id < count - 1 && streq(ScriptLibraryR.globalVars->pFirst[id + 1].name, "LHVMA");
-			int type = isArray ? 2 : 3;
+			int type = isArray ? VAR_TYPE_ARRAY : VAR_TYPE_ATOMIC;
 			ScriptLibraryR.setVarType(type, id);
-			TRACE("type of variable %s (%i) set to %i", var.name, id, type);
+			TRACE("type of variable %s (%i) set to %s", var.name, id, vartype_names[type]);
 		}
 	}
 }
@@ -819,7 +828,7 @@ void debugger_execute_pre(Task* task) {
 		debugger->onPauseBeforeLine(task);
 	} else if (breakpoints.contains(task->ip)) {
 		Breakpoint* breakpoint = breakpoints[task->ip];
-		if (breakpoint->enabled && !breakpoint->disabledByTrigger
+		if (breakpoint->isEnabled() && !breakpoint->disabledByTrigger
 			&& (breakpoint->thread == NULL || breakpoint->thread == getThread(task))) {
 			bool hit = true;
 			if (breakpoint->getCondition() != NULL) {
@@ -834,6 +843,9 @@ void debugger_execute_pre(Task* task) {
 				breakpoint->hits++;
 				if (breakpoint->targetHitCount == 0 || breakpoint->targetHitCount == breakpoint->hits) {
 					lastBreakLine = instruction->linenumber;
+					if (breakpoint->targetHitCount) {
+						breakpoint->setEnabled(false);
+					}
 					debugger->breakpointHit(task, breakpoint);
 				}
 			}
@@ -872,7 +884,7 @@ void debugger_execute_pre(Task* task) {
 			}
 		}
 	} else if (instruction->opcode == SYS
-			&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal]) {
+			&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal] == ENABLED) {
 		debugger->onCatchpoint(task, EV_SYSCALL);
 	}
 }
@@ -897,16 +909,18 @@ void debugger_execute_post(Task* task) {
 	std::list<Watch*> watchesMatched;
 	for (auto entry : watches) {
 		Watch* watch = entry.second;
-		watch->oldValue = watch->newValue;
-		watch->matched = false;
-		if (watch->expression->script == NULL || watch->expression->script->id == task->scriptID) {
-			Var* pNewVal = evalExpression(task, watch->expression);
-			if (pNewVal != NULL) {
-				float newVal = pNewVal->floatVal;
-				if (newVal != watch->oldValue) {
-					watch->newValue = newVal;
-					watch->matched = true;
-					watchesMatched.push_back(watch);
+		if (watch->isEnabled()) {
+			watch->oldValue = watch->newValue;
+			watch->matched = false;
+			if (watch->getExpression()->script == NULL || watch->getExpression()->script->id == task->scriptID) {
+				Var* pNewVal = evalExpression(task, watch->getExpression());
+				if (pNewVal != NULL) {
+					float newVal = pNewVal->floatVal;
+					if (newVal != watch->oldValue) {
+						watch->newValue = newVal;
+						watch->matched = true;
+						watchesMatched.push_back(watch);
+					}
 				}
 			}
 		}
@@ -915,7 +929,7 @@ void debugger_execute_post(Task* task) {
 	if (exception || !watchesMatched.empty()) {
 		lastBreakLine = instruction->linenumber;
 		debugger->onException(task, exception, watchesMatched);
-	} else if (instruction->opcode == SYS && catchSysCalls[instruction->intVal]) {
+	} else if (instruction->opcode == SYS && catchSysCalls[instruction->intVal] == ENABLED) {
 		debugger->onCatchpoint(task, EV_SYSCALL_RET);
 	}
 }
@@ -1002,7 +1016,7 @@ bool isScriptRunning(int scriptId) {
 void deleteScript0(Script* script, bool releaseCode) {
 	if (releaseCode) {
 		const int scriptSize = getScriptSize(script);
-		DEBUG("marking %i instructions at %i as free space", scriptSize, script->instructionAddress);
+		DEBUG("marking instructions %i -> %i as free space", script->instructionAddress, script->instructionAddress + scriptSize);
 		memoryManager.addFreeSpace(script->instructionAddress, scriptSize);
 	}
 	if (script->localVars.pFirst != NULL) {
@@ -1126,7 +1140,6 @@ int parseCode(const char* code, const char* filename) {
 		}
 		//Relocate the scripts from the last
 		DEBUG("relocating scripts");
-		bool shrink = true;
 		while (!scriptsToMove.empty()) {
 			Script* script = scriptsToMove.top();
 			scriptsToMove.pop();
@@ -1136,24 +1149,19 @@ int parseCode(const char* code, const char* filename) {
 				const int prevAddress = script->instructionAddress;
 				DEBUG("relocating script '%s' from %i to %i", script->name, prevAddress, newAddress);
 				if (relocateScript(script, newAddress)) {
-					DEBUG("marking %i instructions at %i as free space", scriptSize, prevAddress);
+					DEBUG("marking instructions %i -> %i as free space", prevAddress, prevAddress + scriptSize);
 					memoryManager.addFreeSpace(prevAddress, scriptSize);
-					if (shrink) {
-						const int currentSize = getTotalInstructions();
-						const int newSize = memoryManager.setTotalSize(currentSize);
-						if (newSize < currentSize) {
-							DEBUG("shrinking code array from %i to %i instructions", currentSize, newSize);
-							ScriptLibraryR.instructions->pEnd = ScriptLibraryR.instructions->pFirst + newSize;
-						} else {
-							shrink = false;
-						}
-					}
 				} else {
-					shrink = false;
+					ERR("code relocation failed");
+					memoryManager.addFreeSpace(newAddress, scriptSize);
 				}
-			} else {
-				shrink = false;
 			}
+		}
+		const int currentSize = getTotalInstructions();
+		const int newSize = memoryManager.setTotalSize(currentSize);
+		if (newSize < currentSize) {
+			DEBUG("shrinking code array from %i to %i instructions", currentSize, newSize);
+			ScriptLibraryR.instructions->pEnd = ScriptLibraryR.instructions->pFirst + newSize;
 		}
 	} else {
 		DEBUG("compile failed with code %i", r);
@@ -1163,7 +1171,7 @@ int parseCode(const char* code, const char* filename) {
 			ScriptEntry* nextEntry = entry->next;
 			Script* script = entry->script;
 			DEBUG("deleting script '%s'", script->name);
-			deleteScript0(script, false);
+			deleteScript0(script, false);	//No need to mark code as free space, the array will be shrinked all at once
 			ScriptLibraryR.free0(entry);
 			entry = nextEntry;
 		}
@@ -1184,11 +1192,13 @@ int parseCode(const char* code, const char* filename) {
 	return r;
 }
 
-Expression* compileExpression0(Script* script, std::string expression, int datatype) {
-	TRACE("compiling expression '%s'", expression.c_str());
-	int varId = getVarId(script, expression.c_str());
+Expression* compileExpression0(Script* script, const std::string sExpression, int datatype) {
+	TRACE("compiling expression '%s'", sExpression.c_str());
+	int varId = getVarId(script, sExpression.c_str());
 	if (varId >= 0) {
-		return new Expression(expression, DT_FLOAT, script, varId);
+		Expression* expr = new Expression(sExpression, DT_FLOAT, script, varId);
+		unusedExpressionsSize += expr->getSize();
+		return expr;
 	}
 	if (varId == INDEX_OUT_OF_BOUNDS) {
 		return NULL;
@@ -1201,7 +1211,8 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 	char localDecl[1024];
 	localDecl[0] = 0;
 	int initLocalCount = 0;
-	if (script != NULL) {
+	if (script != NULL && script->localVars.pEnd - script->localVars.pFirst > 0) {
+		TRACE("copying local variables");
 		char* writePos = localDecl;
 		const char* lastName = **script->localVars.pFirst;
 		int size = 1;
@@ -1221,18 +1232,21 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 			}
 		}
 	}
-	initLocalCount++;	//We will add a local variable named __debugger_result
 	//Split code from return value (last line)
+	TRACE("splitting code from return value");
 	std::string init = "";
-	size_t lastEol = expression.find_last_of("\n");
+	std::string rExpression = sExpression;
+	size_t lastEol = sExpression.find_last_of("\n");
 	if (lastEol != std::string::npos) {
-		init = expression.substr(0, lastEol + 1);
-		expression = expression.substr(lastEol + 1);
+		init = sExpression.substr(0, lastEol + 1);
+		rExpression = sExpression.substr(lastEol + 1);
 	}
 	//Build the code
+	TRACE("building the code");
 	const char* codeTemplate;
 	switch (datatype) {
 		case DT_FLOAT:
+			initLocalCount += 1;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
@@ -1243,6 +1257,7 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 				"end script %1$s";
 			break;
 		case DT_INT:
+			initLocalCount += 1;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
@@ -1253,6 +1268,7 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 				"end script %1$s";
 			break;
 		case DT_BOOLEAN:
+			initLocalCount += 1;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
@@ -1265,17 +1281,48 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 				"	end if\n"
 				"end script %1$s";
 			break;
+		case DT_COORDS:
+			initLocalCount += 4;
+			codeTemplate =
+				"begin script %1$s\n"
+				"%2$s"
+				"	__debugger_result = 0\n"
+				"	__debugger_result_x = 0\n"
+				"	__debugger_result_y = 0\n"
+				"	__debugger_result_z = 0\n"
+				"start\n"
+				"%3$s"
+				"	__debugger_result = marker at (%4$s)\n"
+				"	__debugger_result_x = SCRIPT_OBJECT_PROPERTY_TYPE_XPOS of __debugger_result\n"
+				"	__debugger_result_y = SCRIPT_OBJECT_PROPERTY_TYPE_YPOS of __debugger_result\n"
+				"	__debugger_result_z = SCRIPT_OBJECT_PROPERTY_TYPE_ZPOS of __debugger_result\n"
+				"	delete __debugger_result\n"
+				"end script %1$s";
+			break;
 		default:
 			debugger->onMessage(3, "unsupported datatype");
 			return NULL;
 	}
-	char code[2048];
-	_sprintf_p(code, 2048, codeTemplate, scriptName, localDecl, init.c_str(), expression.c_str());
+	const int bytes = strlen(codeTemplate) + 2 * strlen(scriptName) + strlen(localDecl) + init.length() + rExpression.length() + 1;
+	char* code = (char*)malloc(bytes);
+	if (code == NULL) {
+		ERR("failed to allocate %i bytes", bytes);
+		return NULL;
+	}
+	int r = _sprintf_p(code, bytes, codeTemplate, scriptName, localDecl, init.c_str(), rExpression.c_str());
+	if (r == -1) {
+		ERR("error preparing the code");
+		return NULL;
+	}
 	//Compile
-	if (int r = parseCode(code, filename)) {
+	TRACE("compiling the code");
+	r = parseCode(code, filename);
+	free(code);
+	if (r) {
 		DEBUG("error %i compiling expression", r);
 		return NULL;
 	}
+	TRACE("code compiled without errors");
 	//Find the script just added (always the last)
 	ScriptEntry* prevEntry = NULL;
 	ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList;
@@ -1302,8 +1349,9 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 	const DWORD start = newScript->instructionAddress;
 	const DWORD instructionAddress = newScript->instructionAddress + 2 + initLocalCount * 2;		//Skip instructions before "start"
 	const int ipEnd = findInstruction(newScript->instructionAddress, END);
+	const int size = ipEnd - start + 1;
 	ScriptLibraryR.instructions->pFirst[ipEnd - 3] = ScriptLibraryR.instructions->pFirst[ipEnd];	//Return before exception handler
-	DEBUG("expression compiled at IP %i", start);
+	DEBUG("expression compiled at IP %i, %i instructions", start, size);
 	//Remove the script entry and the script itself...
 	if (prevEntry == NULL) {
 		*ScriptLibraryR.pScriptList = NULL;
@@ -1326,7 +1374,9 @@ Expression* compileExpression0(Script* script, std::string expression, int datat
 	}
 	#endif
 	//
-	return new Expression(expression, datatype, script, globalsCount, start, ipEnd + 1, instructionAddress);
+	Expression* expr = new Expression(sExpression, datatype, script, globalsCount, start, size, instructionAddress);
+	unusedExpressionsSize += expr->getSize();
+	return expr;
 }
 
 bool checkMessage(ParserMessages messages, DWORD minSeverity, std::string text) {
@@ -1374,7 +1424,15 @@ Expression* compileExpression(Script* script, std::string expression, int dataty
 			throwParserMessages(messages);
 			return NULL;
 		}
-		DEBUG("expression is not of type float, trying as int...");
+		DEBUG("expression is not of type float, trying as coords...");
+		//
+		expr = tryCompileExpression(script, expression, DT_COORDS, &messages);
+		if (expr != NULL) return expr;
+		if (!checkMessage(messages, 0, "parse error")) {
+			throwParserMessages(messages);
+			return NULL;
+		}
+		DEBUG("expression is not of type coords, trying as int...");
 		//
 		expr = tryCompileExpression(script, expression, DT_INT, &messages);
 		if (expr != NULL) return expr;
@@ -1387,50 +1445,44 @@ Expression* compileExpression(Script* script, std::string expression, int dataty
 	}
 }
 
-int getUnusedExpressionsSize() {
-	int size = 0;
-	for (auto cacheEntry : expressionsCache) {
-		for (auto exprEntry : cacheEntry.second) {
-			auto expr = exprEntry.second;
-			size += expr->getSize();
-		}
-	}
-	return size;
-}
-
 size_t deleteExpression(Expression* expr) {
 	if (expr->refCount > 0) {
 		ERR("cannot delete expression '%s' because it has %i references", expr->str.c_str(), expr->refCount);
 		return 0;
 	}
-	size_t res = expr->getSize();
+	const size_t size = expr->getSize();
 	//Remove expression from cache
-	int scriptId = expr->script != NULL ? expr->script->id : 0;
+	const int scriptId = expr->script != NULL ? expr->script->id : 0;
 	if (expressionsCache.contains(scriptId)) {
 		auto& cache = expressionsCache[scriptId];
 		if (cache.contains(expr->str)) {
 			cache.erase(expr->str);
+			DEBUG("expression '%s' removed from cache, %i bytes freed", expr->str.c_str(), size);
+		} else {
+			DEBUG("expression '%s' not found in cache", expr->str.c_str());
 		}
+	} else {
+		DEBUG("cache for script %i not found", scriptId);
 	}
 	//Free code space
 	if (expr->start >= 0) {
-		const size_t size = expr->getInstructionsCount();
-		DEBUG("marking %i instructions at %i as free space", size, expr->start);
-		memoryManager.addFreeSpace(expr->start, size);
+		DEBUG("marking instructions %i -> %i as free space", expr->start, expr->start + expr->instructionsCount);
+		memoryManager.addFreeSpace(expr->start, expr->instructionsCount);
 	}
 	//
+	unusedExpressionsSize -= size;
 	delete expr;
-	return res;
+	return size;
 }
 
 void deleteUnusedExpressions() {
 	for (auto cacheEntry : expressionsCache) {
-		auto cache = cacheEntry.second;
-		for (auto it = cache.cbegin(); it != cache.cend(); ) {
+		auto& cache = cacheEntry.second;
+		for (auto it = cache.begin(); it != cache.end(); ) {
 			auto expr = (*it).second;
 			if (expr->refCount == 0) {
+				DEBUG("expression '%s' has 0 references, removing from cache", (*it).first.c_str());
 				size_t freed = deleteExpression(expr);
-				DEBUG("expression '%s' removed from cache, %i bytes freed", (*it).first.c_str(), freed);
 				cache.erase(it++);
 			} else {
 				++it;
@@ -1441,7 +1493,7 @@ void deleteUnusedExpressions() {
 
 void collectGarbage() {
 	bool shrink = false;
-	if (getUnusedExpressionsSize() > 128) {
+	if (unusedExpressionsSize > MAX_UNUSED_EXPRESSIONS_BYTES) {
 		DEBUG("collecting garbage");
 		deleteUnusedExpressions();
 		shrink = true;
@@ -1483,32 +1535,63 @@ Var* evalExpression(Task* context, Expression* expr) {
 	if (expr->varId >= 0) {
 		return getVarById(context, expr->varId);
 	}
+	const int addedVarsCount = expr->datatype == DT_COORDS ? 4 : 1;
 	Task evalTask;
+	Var tmpLocals[4];
 	evalTask.globalsCount = expr->globalsCount;
 	int localVarsCount = 0;
 	if (context != NULL) {
-		localVarsCount = getLocalVarsCount(context);
-		if (localVarsCount >= maxLocalVars) {
-			maxLocalVars = localVarsCount + 64;
-			free(localVarsCopy);
-			localVarsCopy = (Var*)malloc(sizeof(Var) * maxLocalVars);
+		Script* script = getTaskScript(context);
+		const int scriptLocalVarsCount = script->localVars.pEnd - script->localVars.pFirst;
+		const int taskLocalVarsCount = getLocalVarsCount(context);
+		const int requiredVarsCount = scriptLocalVarsCount + addedVarsCount;
+		if (taskLocalVarsCount < requiredVarsCount) {
+			const int bytes = sizeof(Var) * requiredVarsCount;
+			Var* newLocalVars = (Var*)ScriptLibraryR.operator_new(bytes);
+			if (newLocalVars == NULL) {
+				ERR("failed to allocate %i bytes", bytes);
+				return NULL;
+			}
+			if (taskLocalVarsCount > 0) {
+				for (int i = 0; i < taskLocalVarsCount; i++) {
+					newLocalVars[i] = context->localVars.pFirst[i];
+				}
+				ScriptLibraryR.free0(context->localVars.pFirst);
+			}
+			context->localVars.pFirst = newLocalVars;
+			context->localVars.pEnd = newLocalVars + requiredVarsCount;
+			context->localVars.pBufferEnd = newLocalVars + requiredVarsCount;
 		}
+		evalTask.localVars.pFirst = context->localVars.pFirst;
+		evalTask.localVars.pEnd = context->localVars.pEnd;
+		evalTask.localVars.pBufferEnd = context->localVars.pBufferEnd;
+	} else {
+		evalTask.localVars.pFirst = tmpLocals;
+		evalTask.localVars.pEnd = tmpLocals + addedVarsCount;
+		evalTask.localVars.pBufferEnd = tmpLocals + addedVarsCount;
 	}
 	//
-	evalTask.localVars.pFirst = localVarsCopy;
-	evalTask.localVars.pEnd = evalTask.localVars.pFirst + localVarsCount + 1;
-	evalTask.localVars.pBufferEnd = localVarsCopy + maxLocalVars;
-	if (context != NULL) {
-		Var* src = context->localVars.pFirst;
-		Var* dst = evalTask.localVars.pFirst;
-		for (int i = 0; i < localVarsCount; i++, src++, dst++) {
-			*dst = *src;
-		}
+	Var* result;
+	if (expr->datatype == DT_COORDS) {
+		result = evalTask.localVars.pEnd - 3;
+		result[-1].name = "__debugger_result";
+		result[-1].type = 2;
+		result[-1].floatVal = NAN;
+		result[0].name = "__debugger_result_x";
+		result[0].type = 2;
+		result[0].floatVal = NAN;
+		result[1].name = "__debugger_result_y";
+		result[1].type = 2;
+		result[1].floatVal = NAN;
+		result[2].name = "__debugger_result_z";
+		result[2].type = 2;
+		result[2].floatVal = NAN;
+	} else {
+		result = evalTask.localVars.pEnd - 1;
+		result->name = "__debugger_result";
+		result->type = 2;
+		result->floatVal = NAN;
 	}
-	Var* result = evalTask.localVars.pEnd - 1;
-	result->name = "__debugger_result";
-	result->type = 3;
-	result->floatVal = NAN;
 	//
 	evalTask.currentExceptionHandlerIndex = 0;
 	evalTask.exceptionHandlerIps.pFirst = 0;
@@ -1553,15 +1636,16 @@ Var* evalExpression(Task* context, Expression* expr) {
 Var* evalString(Task* context, std::string expression, int& datatype) {
 	if (isNumber(expression)) {
 		datatype = DT_FLOAT;
-		Var* var = localVarsCopy + maxLocalVars - 1;
-		var->floatVal = (FLOAT)atof(expression.c_str());
-		return var;
+		resultVar.floatVal = (FLOAT)atof(expression.c_str());
+		return &resultVar;
 	}
 	Script* script = getTaskScript(context);
-	int varId = getVarId(script, expression.c_str());
-	if (varId >= 0) {
-		datatype = DT_FLOAT;
-		return getVarById(context, varId);
+	if (datatype != DT_COORDS) {
+		int varId = getVarId(script, expression.c_str());
+		if (varId >= 0) {
+			datatype = DT_FLOAT;
+			return getVarById(context, varId);
+		}
 	}
 	Expression* expr = getCompiledExpression(script, expression, datatype);
 	if (expr == NULL) return NULL;
@@ -1587,6 +1671,7 @@ Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* th
 			return NULL;
 		}
 		breakpoint->setCondition(cond);
+		unusedExpressionsSize -= cond->getSize();
 	}
 	breakpoints[ip] = breakpoint;
 	TRACE("breakpoint set at %i", ip);
@@ -1596,6 +1681,9 @@ Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* th
 bool unsetBreakpoint(Breakpoint* breakpoint) {
 	if (breakpoints.contains(breakpoint->ip)) {
 		breakpoints.erase(breakpoint->ip);
+		if (breakpoint->getCondition() != NULL) {
+			unusedExpressionsSize += breakpoint->getCondition()->getSize();
+		}
 		delete breakpoint;
 		return true;
 	} else {
@@ -1644,8 +1732,15 @@ bool setCondition(Breakpoint* breakpoint, const char* condition) {
 	if (condition != NULL) {
 		Expression* expr = getCompiledExpression(breakpoint->script, condition, DT_BOOLEAN);
 		if (expr == NULL) return false;
+		if (breakpoint->getCondition() != NULL) {
+			unusedExpressionsSize += breakpoint->getCondition()->getSize();
+		}
 		breakpoint->setCondition(expr);
+		unusedExpressionsSize -= expr->getSize();
 	} else {
+		if (breakpoint->getCondition() != NULL) {
+			unusedExpressionsSize += breakpoint->getCondition()->getSize();
+		}
 		breakpoint->setCondition(NULL);
 	}
 	return true;
@@ -1681,6 +1776,7 @@ Watch* addWatch(Task* task, const char* expression) {
 		DEBUG("expression %s compiled in global context", expression);
 	}
 	Watch* watch = new Watch(task, expr);
+	unusedExpressionsSize -= expr->getSize();
 	const std::string key = watch->getKey();
 	if (watches.contains(key)) {
 		debugger->onMessage(2, "Watch already exists.");
@@ -1718,6 +1814,7 @@ Watch* getWatchByIndex(DWORD index) {
 bool deleteWatch(Watch* watch) {
 	if (watches.contains(watch->getKey())) {
 		watches.erase(watch->getKey());
+		unusedExpressionsSize += watch->getExpression()->getSize();
 		delete watch;
 		return true;
 	} else {

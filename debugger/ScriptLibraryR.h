@@ -18,6 +18,12 @@ enum DataTypes {
 	DT_NONE, DT_INT, DT_FLOAT, DT_COORDS, DT_OBJECT, DT_UNK5, DT_BOOLEAN, DT_VAR
 };
 
+enum VarTypes {
+	VAR_TYPE_REFERENCE = 1,	//?
+	VAR_TYPE_ARRAY = 2,
+	VAR_TYPE_ATOMIC = 3
+};
+
 struct Var {
 	DWORD type;
 	union {
@@ -257,8 +263,8 @@ struct ScriptLibraryRDll {
 	//Internal functions
 	FUNC(pLoadGameHeaders, char(__cdecl* loadGameHeaders)(const char* gamePath));
 	FUNC(pGetVarType, int(__cdecl* getVarType)(int varId));
-	FUNC(pSetVarType, void(__cdecl* setVarType)(int type, int varId));
-	FUNC(pCreateVar, int(__cdecl* createVar)(const char* varName, int type, const char* scriptName, int global));
+	FUNC(pSetVarType, void(__cdecl* setVarType)(int type, int varId));	//type is VarTypes
+	FUNC(pCreateVar, int(__cdecl* createVar)(const char* varName, int type, const char* scriptName, int global));	//type is DataType
 	FUNC(pDoStartScript, DWORD(__cdecl* doStartScript)(Script* pScript));
 	FUNC(pStopTask0, int(__cdecl* stopTask0)(Task* pTask));
 	FUNC(pTaskExists, int(__cdecl* taskExists)(int taskNumber));
