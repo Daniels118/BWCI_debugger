@@ -21,7 +21,11 @@
 #	undef _PAUSE_ON
 #	define _PAUSE_ON PAUSE_ON
 #else
-#	define _PAUSE_ON 0
+#	define _PAUSE_ON LL_NONE
+#endif
+
+#ifndef __FILENAME__
+#define __FILENAME__ __FILE__
 #endif
 
 #undef ERR
@@ -31,21 +35,21 @@
 #undef DEBUG
 #undef TRACE
 
-#if _LOG_LEVEL >= LL_ERR
-#	if _PAUSE_ON >= LL_ERR
-#		define ERR(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
+#if _LOG_LEVEL >= LL_ERROR
+#	if _PAUSE_ON >= LL_ERROR
+#		define ERR(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
 #	else
-#		define ERR(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
+#		define ERR(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
 #	endif
 #else
 #	define ERR(format, ...)
 #endif
 
-#if _LOG_LEVEL >= LL_WARN
-#	if _PAUSE_ON >= LL_WARN
-#		define WARNING(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
+#if _LOG_LEVEL >= LL_WARNING
+#	if _PAUSE_ON >= LL_WARNING
+#		define WARNING(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
 #	else
-#		define WARNING(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
+#		define WARNING(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
 #	endif
 #else
 #	define WARNING(format, ...)
@@ -53,9 +57,9 @@
 
 #if _LOG_LEVEL >= LL_NOTICE
 #	if _PAUSE_ON >= LL_NOTICE
-#		define NOTICE(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
+#		define NOTICE(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
 #	else
-#		define NOTICE(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
+#		define NOTICE(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
 #	endif
 #else
 #	define NOTICE(format, ...)
@@ -63,9 +67,9 @@
 
 #if _LOG_LEVEL >= LL_INFO
 #	if _PAUSE_ON >= LL_INFO
-#		define INFO(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
+#		define INFO(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
 #	else
-#		define INFO(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
+#		define INFO(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
 #	endif
 #else
 #	define INFO(format, ...)
@@ -73,9 +77,9 @@
 
 #if _LOG_LEVEL >= LL_DEBUG
 #	if _PAUSE_ON >= LL_DEBUG
-#		define DEBUG(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
+#		define DEBUG(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
 #	else
-#		define DEBUG(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
+#		define DEBUG(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
 #	endif
 #else
 #	define DEBUG(format, ...)
@@ -83,9 +87,9 @@
 
 #if _LOG_LEVEL >= LL_TRACE
 #	if _PAUSE_ON >= LL_TRACE
-#		define TRACE(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
+#		define TRACE(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__); PAUSE;
 #	else
-#		define TRACE(format, ...) printf("debugger:" __FILE__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
+#		define TRACE(format, ...) printf("debugger:" __FILENAME__ ":%i: " format "\n", __LINE__, ##__VA_ARGS__);
 #	endif
 #else
 #	define TRACE(format, ...)

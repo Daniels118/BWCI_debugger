@@ -43,6 +43,7 @@ class Gdb : public Debugger {
 		static Task* currentFrame;
 		static int compiledThreadId;
 		static int resumeThreadId;
+		static bool runningCompileCommand;
 
 		static std::list<Display*> displays;
 
@@ -63,7 +64,7 @@ class Gdb : public Debugger {
 			int argc = splitArgs(buffer, ' ', argv, MAX_ARGS);
 			char* script = getArgVal(argv, argc, "/gdb:script");
 			if (script != NULL) {
-				commandQueue.push_back("source " + std::string(script));
+				commandQueue.push_front("source " + std::string(script));
 			}
 		}
 
@@ -86,7 +87,9 @@ class Gdb : public Debugger {
 		}
 
 		void threadStarted(Task* thread) {
-			printf("New Thread %i \"%s\"\n", thread->taskNumber, thread->name);
+			if (!runningCompileCommand) {
+				printf("New Thread %i \"%s\"\n", thread->taskNumber, thread->name);
+			}
 		}
 
 		void threadResumed(Task* thread) {
@@ -99,7 +102,9 @@ class Gdb : public Debugger {
 			if (thread == catchThread) {
 				catchThread = NULL;
 			}
-			printf("Thread %i \"%s\" ended\n", thread->taskNumber, thread->name);
+			if (!runningCompileCommand) {
+				printf("Thread %i \"%s\" ended\n", thread->taskNumber, thread->name);
+			}
 			if (thread->taskNumber == compiledThreadId) {
 				allowedThreadId = resumeThreadId;	//Resume from previous thread and
 				pause = true;						//  stop when previous thread resumes
@@ -118,9 +123,7 @@ class Gdb : public Debugger {
 				printf("Breakpoint disabled.\n");
 			}
 			currentFrame = task;
-			for (std::string cmd : breakpoint->commands) {
-				commandQueue.push_back(cmd);
-			}
+			commandQueue.insert(commandQueue.begin(), breakpoint->commands.begin(), breakpoint->commands.end());
 			printDisplays(task);
 			printCurrentLine(task);
 			readAndExecuteCommand(task);
@@ -178,7 +181,7 @@ class Gdb : public Debugger {
 		}
 
 		void onMessage(DWORD severity, const char* format, ...) {
-			if (severity != 0) {
+			if (severity != 0 && !runningCompileCommand) {
 				va_list args;
 				va_start(args, format);
 				vprintf(format, args);
@@ -209,12 +212,13 @@ class Gdb : public Debugger {
 
 		static void checkTempScriptEnded() {
 			if (compiledThreadId != 0 && !ScriptLibraryR.taskExists(compiledThreadId)) {
-				compiledThreadId = 0;
 				resumeThreadId = 0;
 				if (deleteScriptByName("_gdb_expr_")) {
 					unsetSource("__debugger_compile");
-					printf("Script '_gdb_expr_' deleted.\n");
+					//printf("Script '_gdb_expr_' deleted.\n");
 				}
+				compiledThreadId = 0;
+				runningCompileCommand = false;
 			}
 		}
 
@@ -778,7 +782,7 @@ class Gdb : public Debugger {
 			//################################################################################################## COMPILE
 			} else if (streq(cmd, "compile")) {
 				if (argc >= 2) {
-					if (resumeThreadId != 0) {
+					if (runningCompileCommand) {
 						printf("A compiled code is already running.\n");
 						return false;
 					}
@@ -810,7 +814,8 @@ class Gdb : public Debugger {
 								lines.push_back(expr);
 							} else {
 								while (prompt(">")) {
-									if (streq(buffer, "end")) break;
+									const char* cmd2 = ltrim(buffer);
+									if (streq(cmd2, "end")) break;
 									lines.push_back(buffer);
 								}
 							}
@@ -845,6 +850,7 @@ class Gdb : public Debugger {
 								if (currentFrame != NULL) {
 									resumeThreadId = getThread(currentFrame)->taskNumber;
 								}
+								runningCompileCommand = true;
 								compiledThreadId = ScriptLibraryR.StartScript(0, "_gdb_expr_", -1);
 								allowedThreadId = compiledThreadId;
 								return true;
@@ -889,8 +895,20 @@ class Gdb : public Debugger {
 					const char* name = argv[1];
 					auto& ucmd = userCommands[name];
 					ucmd.commands.clear();
+					int depth = 1;
+					bool inCompile = false;
 					while (prompt(">")) {
-						if (streq(buffer, "end")) break;
+						const char* cmd2 = ltrim(buffer);
+						if (!inCompile && (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0)) {
+							depth++;
+						} else if (strncmp(cmd2, "compile ", 8) == 0 && std::string(buffer).ends_with(" --")) {
+							inCompile = true;
+							depth++;
+						} else if (streq(cmd2, "end")) {
+							inCompile = false;
+							depth--;
+							if (depth == 0) break;
+						}
 						ucmd.commands.push_back(buffer);
 					}
 					return false;
@@ -2269,12 +2287,13 @@ class Gdb : public Debugger {
 				}
 			//################################################################################################## <USER_COMMAND>
 			} else if (userCommands.contains(cmd)) {
+				auto it = commandQueue.begin();
 				auto& ucmd = userCommands[cmd];
 				for (auto line : ucmd.commands) {
 					for (int i = 1; i < argc; i++) {
 						line = strReplace(line, "$arg"+std::to_string(i - 1), argv[i]);
 					}
-					commandQueue.push_back(line);
+					commandQueue.insert(it, line);
 				}
 				return false;
 			}
@@ -2297,6 +2316,7 @@ int Gdb::lastPrintedLine = 0;
 Task* Gdb::currentFrame = NULL;
 int Gdb::compiledThreadId = 0;
 int Gdb::resumeThreadId = 0;
+bool Gdb::runningCompileCommand = false;
 
 std::list<Display*> Gdb::displays = std::list<Display*>();
 

@@ -627,7 +627,12 @@ Var* getGlobalVar(const char* name) {
 }
 
 int declareGlobalVar(const char* name) {
-	const int id = ScriptLibraryR.createVar(name, DT_FLOAT, NULL, TRUE);
+	int id = getGlobalVarId(name, 0);
+	if (id >= 0) {
+		ERR("variable '%s' already exists", name);
+		return -1;
+	}
+	id = ScriptLibraryR.createVar(name, DT_FLOAT, NULL, TRUE);
 	ScriptLibraryR.setVarType(VAR_TYPE_ATOMIC, id);
 	return id;
 }

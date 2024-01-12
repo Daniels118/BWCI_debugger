@@ -29,47 +29,46 @@ class MemoryManager {
 
 	public:
 		bool addFreeSpace(const int address, const int size) {
-			if (freeSegments.empty()) {
-				TRACE("adding segment %i -> %i", address, address + size);
-				freeSegments.push_front(Segment(address, size));
-			} else {
-				for (auto pos = freeSegments.begin(); pos != freeSegments.end(); ++pos) {
-					Segment& segment = *pos;
-					if (segment.address >= address) {
-						if (address + size < segment.address) {
-							TRACE("adding segment %i -> %i", address, address + size);
-							freeSegments.insert(pos, Segment(address, size));	//Insert new segment before current segment
-						} else if (address + size == segment.address) {
-							TRACE("extending segment %i -> %i backward to %i -> %i", segment.address, segment.address + segment.size,
-									address, segment.address + segment.size);
-							segment.address = address;			//New segment ends at current segment, extend backward
-							segment.size += size;
-						} else {
-							ERR("segment %i -> %i overlaps with %i -> %i\n", address, address + size,
-									segment.address, segment.address + segment.size);
-							return false;						//New segment overlaps next segment, fail
-						}
-						return true;
-					} else if (segment.address + segment.size == address) {
-						TRACE("extending segment %i -> %i to %i -> %i", segment.address, segment.address + segment.size,
-								segment.address, segment.address + segment.size + size);
-						segment.size += size;					//Current segment ends at new segment, extend forward
-						return true;
-					} else if (segment.address + segment.size > address) {
-						ERR("segment %i -> %i overlaps with %i -> %i", address, address + size,
-								segment.address, segment.address + segment.size);
-						return false;							//Current segment overlaps new segment, fail
-					}
-				}
-				TRACE("adding segment %i -> %i", address, address + size);
-				freeSegments.push_back(Segment(address, size));	//Insert new segment after last segment
+			if (size <= 0) {
+				TRACE("not adding zero length segment at %i", address);
+				return false;
 			}
+			for (auto pos = freeSegments.begin(); pos != freeSegments.end(); ++pos) {
+				Segment& segment = *pos;
+				if (segment.address >= address) {
+					if (address + size < segment.address) {
+						TRACE("adding segment %i -> %i", address, address + size);
+						freeSegments.insert(pos, Segment(address, size));	//Insert new segment before current segment
+					} else if (address + size == segment.address) {
+						TRACE("extending segment %i -> %i backward to %i -> %i", segment.address, segment.address + segment.size,
+								address, segment.address + segment.size);
+						segment.address = address;			//New segment ends at current segment, extend backward
+						segment.size += size;
+					} else {
+						ERR("segment %i -> %i overlaps with %i -> %i\n", address, address + size,
+								segment.address, segment.address + segment.size);
+						return false;						//New segment overlaps next segment, fail
+					}
+					return true;
+				} else if (segment.address + segment.size == address) {
+					TRACE("extending segment %i -> %i to %i -> %i", segment.address, segment.address + segment.size,
+							segment.address, segment.address + segment.size + size);
+					segment.size += size;					//Current segment ends at new segment, extend forward
+					return true;
+				} else if (segment.address + segment.size > address) {
+					ERR("segment %i -> %i overlaps with %i -> %i", address, address + size,
+							segment.address, segment.address + segment.size);
+					return false;							//Current segment overlaps new segment, fail
+				}
+			}
+			TRACE("adding segment %i -> %i", address, address + size);
+			freeSegments.push_back(Segment(address, size));	//Insert new segment after last segment
 			return true;
 		}
 
 		int getFreeSpace(const int size) {
 			for (auto pos = freeSegments.begin(); pos != freeSegments.end(); ++pos) {
-				Segment segment = *pos;
+				Segment& segment = *pos;
 				if (segment.size == size) {
 					const int address = segment.address;
 					freeSegments.erase(pos);
