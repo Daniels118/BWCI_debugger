@@ -293,6 +293,8 @@ extern bool pause;
 extern std::stack<ParserMessages*> parseMessagesTraps;
 extern int allowedThreadId;
 
+extern bool gamePaused;
+
 extern std::map<DWORD, std::string> scriptType_names;
 
 extern const char* datatype_names[8];

@@ -68,7 +68,9 @@ std::string parseTempFile = "";
 
 int allowedThreadId = 0;
 
-Var resultVar;
+Var tmpLocals[4];
+
+bool gamePaused = false;
 
 int __cdecl errorCallback(DWORD severity, const char* msg);
 int getScriptSize(Script* script);
@@ -761,6 +763,7 @@ void onChlLoaded() {
 	DEBUG("CHL loaded");
 	breakFromAddress = 0;
 	pause = false;
+	gamePaused = false;
 	//
 	initVarTypes();
 	//
@@ -921,7 +924,9 @@ void debugger_execute_post(Task* task) {
 				Var* pNewVal = evalExpression(task, watch->getExpression());
 				if (pNewVal != NULL) {
 					float newVal = pNewVal->floatVal;
-					if (newVal != watch->oldValue) {
+					bool oldNaN = std::isnan(watch->oldValue);
+					bool newNaN = std::isnan(newVal);
+					if (newVal != watch->oldValue && !(oldNaN && newNaN)) {
 						watch->newValue = newVal;
 						watch->matched = true;
 						watchesMatched.push_back(watch);
@@ -1317,6 +1322,7 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	int r = _sprintf_p(code, bytes, codeTemplate, scriptName, localDecl, init.c_str(), rExpression.c_str());
 	if (r == -1) {
 		ERR("error preparing the code");
+		free(code);
 		return NULL;
 	}
 	//Compile
@@ -1540,14 +1546,13 @@ Var* evalExpression(Task* context, Expression* expr) {
 	if (expr->varId >= 0) {
 		return getVarById(context, expr->varId);
 	}
-	const int addedVarsCount = expr->datatype == DT_COORDS ? 4 : 1;
 	Task evalTask;
-	Var tmpLocals[4];
+	const int addedVarsCount = expr->datatype == DT_COORDS ? 4 : 1;
 	evalTask.globalsCount = expr->globalsCount;
-	int localVarsCount = 0;
+	int scriptLocalVarsCount = 0;
 	if (context != NULL) {
 		Script* script = getTaskScript(context);
-		const int scriptLocalVarsCount = script->localVars.pEnd - script->localVars.pFirst;
+		scriptLocalVarsCount = script->localVars.pEnd - script->localVars.pFirst;
 		const int taskLocalVarsCount = getLocalVarsCount(context);
 		const int requiredVarsCount = scriptLocalVarsCount + addedVarsCount;
 		if (taskLocalVarsCount < requiredVarsCount) {
@@ -1578,23 +1583,23 @@ Var* evalExpression(Task* context, Expression* expr) {
 	//
 	Var* result;
 	if (expr->datatype == DT_COORDS) {
-		result = evalTask.localVars.pEnd - 3;
-		result[-1].name = "__debugger_result";
-		result[-1].type = 2;
+		result = evalTask.localVars.pFirst + scriptLocalVarsCount + 1;	//__debugger_result_x
+		result[-1].name = "__debugger_result";	//No need to call _strdup, calling free on static memory has no effect!
+		result[-1].type = DT_FLOAT;
 		result[-1].floatVal = NAN;
 		result[0].name = "__debugger_result_x";
-		result[0].type = 2;
+		result[0].type = DT_FLOAT;
 		result[0].floatVal = NAN;
 		result[1].name = "__debugger_result_y";
-		result[1].type = 2;
+		result[1].type = DT_FLOAT;
 		result[1].floatVal = NAN;
 		result[2].name = "__debugger_result_z";
-		result[2].type = 2;
+		result[2].type = DT_FLOAT;
 		result[2].floatVal = NAN;
 	} else {
-		result = evalTask.localVars.pEnd - 1;
+		result = evalTask.localVars.pFirst + scriptLocalVarsCount;
 		result->name = "__debugger_result";
-		result->type = 2;
+		result->type = DT_FLOAT;
 		result->floatVal = NAN;
 	}
 	//
@@ -1641,8 +1646,8 @@ Var* evalExpression(Task* context, Expression* expr) {
 Var* evalString(Task* context, std::string expression, int& datatype) {
 	if (isNumber(expression)) {
 		datatype = DT_FLOAT;
-		resultVar.floatVal = (FLOAT)atof(expression.c_str());
-		return &resultVar;
+		tmpLocals[0].floatVal = (FLOAT)atof(expression.c_str());
+		return tmpLocals;
 	}
 	Script* script = getTaskScript(context);
 	if (datatype != DT_COORDS) {
@@ -1996,7 +2001,7 @@ void initScriptLibraryR() {
 			ScriptLibraryR.ppCurrentStack			= (Stack**)			(ScriptLibraryR.base + ppCurrentStackOffset);
 			ScriptLibraryR.opcodesImpl				= (OpcodeImpl*)		(ScriptLibraryR.base + opcodesImplOffset);
 			ScriptLibraryR.pStrNotCompiled			= (char**)			(ScriptLibraryR.base + strNotCompiledOffset);
-			ScriptLibraryR.pParseFileDefaultInput	= (FILE*)			(ScriptLibraryR.base + parseFileDefaultInputOffset);
+			ScriptLibraryR.pParseFileDefaultInput	= (UFILE*)			(ScriptLibraryR.base + parseFileDefaultInputOffset);
 			ScriptLibraryR.instructions				= (InstructionVector*)(ScriptLibraryR.base + pInstructionsOffset);
 			ScriptLibraryR.ppCurrentTaskExceptStruct= (ExceptStruct**)	(ScriptLibraryR.base + pCurrentTaskExceptStructOffset);
 			ScriptLibraryR.pMainStack				= (Stack*)			(ScriptLibraryR.base + mainStackOffset);
@@ -2016,9 +2021,12 @@ void initScriptLibraryR() {
 			ScriptLibraryR.pTaskVarsCount			= (DWORD*)			(ScriptLibraryR.base + taskVarsCountOffset);
 			ScriptLibraryR.pParserTraceEnabled		= (DWORD*)			(ScriptLibraryR.base + parserTraceEnabledOffset);
 			ScriptLibraryR.pCurrentFilename			= (char**)			(ScriptLibraryR.base + currentFilenameOffset);
-			ScriptLibraryR.ppParseFileInputStream	= (FILE**)			(ScriptLibraryR.base + pParseFileInputStreamOffset);
+			ScriptLibraryR.ppParseFileInputStream	= (UFILE**)			(ScriptLibraryR.base + pParseFileInputStreamOffset);
 			ScriptLibraryR.pErrorsCount				= (DWORD**)			(ScriptLibraryR.base + errorsCountOffset);
-			//
+			//NOPs
+			if (DWORD r = nop((LPVOID)(ScriptLibraryR.base + printParseErrorBeepOffset), MessageBeep_size)) {
+				WARNING("failed to NOP MessageBeep call, error is %i", r);
+			}
 			detourScriptLibraryR();
 		} else {
 			Fail("ERROR: this debugger.dll can work only with LHVM 8 (Black & White: Creature Isle runtime)");
@@ -2026,9 +2034,10 @@ void initScriptLibraryR() {
 	}
 }
 
-void PauseGame_Detour(int num, int edx) {
-	TRACE("game paused (%d)", num);
-	PauseGame(num);
+void PauseGame_Detour(int paused, int edx) {
+	TRACE("game paused (%d)", paused);
+	gamePaused = paused;
+	PauseGame(paused);
 }
 
 int __fastcall GGame__LoadScriptLibrary_Detour(void* _this, int edx, int a2) {

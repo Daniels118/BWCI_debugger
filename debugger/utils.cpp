@@ -3,6 +3,86 @@
 #include <filesystem>
 #include <fstream>
 
+struct HandleData {
+    DWORD pid;
+    HWND window;
+};
+
+DWORD nop(LPVOID address, SIZE_T size) {
+    DWORD oldProtect;
+    if (VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        BYTE* p = (BYTE*)address;
+        for (SIZE_T i = 0; i < size; i++, p++) {
+            *p = 0x90;
+        }
+        VirtualProtect(address, size, oldProtect, &oldProtect);
+        return 0;
+    }
+    return GetLastError();
+}
+
+BOOL isMainWindow(HWND handle) {
+    return GetWindow(handle, GW_OWNER) == NULL && IsWindowVisible(handle);
+}
+
+BOOL CALLBACK enumWindowsCallback(HWND handle, LPARAM lParam) {
+    HandleData& data = *(HandleData*)lParam;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(handle, &pid);
+    if (data.pid != pid || !isMainWindow(handle)) {
+        return TRUE;
+    }
+    data.window = handle;
+    return FALSE;
+}
+
+HWND findMainWindow(DWORD pid) {
+    HandleData data;
+    if (pid == NULL) {
+        pid = GetCurrentProcessId();
+    }
+    data.pid = pid;
+    data.window = 0;
+    EnumWindows(enumWindowsCallback, (LPARAM)&data);
+    return data.window;
+}
+
+bool alignWindow(HWND window, HWND ref, Anchor anchor) {
+    RECT refRect;
+    if (ref == NULL) {
+        ref = GetDesktopWindow();
+        SystemParametersInfo(SPI_GETWORKAREA, 0, &refRect, 0);
+    } else {
+        GetWindowRect(ref, &refRect);
+    }
+    RECT rect;
+    GetWindowRect(window, &rect);
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    int x, y;
+    switch (anchor) {
+        case TOP_LEFT:
+            x = refRect.left;
+            y = refRect.top;
+            break;
+        case TOP_RIGHT:
+            x = refRect.right - width;
+            y = refRect.top;
+            break;
+        case BOTTOM_RIGHT:
+            x = refRect.right - width;
+            y = refRect.bottom - height;
+            break;
+        case BOTTOM_LEFT:
+            x = refRect.left;
+            y = refRect.bottom - height;
+            break;
+        default:
+            return false;
+    }
+    return SetWindowPos(window, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
+
 std::string searchPaths(std::set<std::string> paths, std::string filename) {
     auto filepath = std::filesystem::path(filename);
     if (filepath.is_absolute()) {

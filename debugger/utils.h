@@ -7,10 +7,20 @@
 #include <filesystem>
 #include <windows.h>
 
+enum Anchor {
+	TOP_LEFT, TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT
+};
+
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define streq(STRING1, STRING2) strcmp(STRING1, STRING2) == 0
+
+DWORD nop(LPVOID address, SIZE_T size);
+
+HWND findMainWindow(DWORD pid);
+BOOL isMainWindow(HWND handle);
+bool alignWindow(HWND window, HWND ref, Anchor side);
 
 std::string searchPaths(std::set<std::string> paths, std::string subpath);
 std::vector<std::string> readFile(std::filesystem::path path);

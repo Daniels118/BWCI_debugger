@@ -154,6 +154,12 @@ typedef DWORD(__cdecl* OpcodeImpl)(Task* pTask, Instruction* pInstr);
 
 typedef int(__cdecl* ErrorCallback)(DWORD severity, const char* msg);
 
+typedef void UFILE;	//Fake type for FILEs handled using the statically linked C-runtime
+
+//Instructions to NOP
+#define printParseErrorBeepOffset		0xC392
+#define MessageBeep_size	8
+
 //DLL statically linked C-runtime functions
 #define operator_new_Offset				0x179B6
 #define freeOffset						0x17F27
@@ -283,7 +289,7 @@ struct ScriptLibraryRDll {
 	Stack**				ppCurrentStack;				//0x2561C
 	OpcodeImpl*			opcodesImpl;				//0x25624
 	char**				pStrNotCompiled;			//0x25A98
-	FILE*				pParseFileDefaultInput;		//0x40E38
+	UFILE*				pParseFileDefaultInput;		//0x40E38
 	InstructionVector*	instructions;				//0x447DC
 	ExceptStruct**		ppCurrentTaskExceptStruct;	//0x447E8
 	Stack*				pMainStack;					//0x447F8
@@ -303,7 +309,7 @@ struct ScriptLibraryRDll {
 	DWORD*				pTaskVarsCount;				//0x459B0
 	DWORD*				pParserTraceEnabled;		//0x45E6C
 	char**				pCurrentFilename;			//0x45E78
-	FILE**				ppParseFileInputStream;		//0x459D4
+	UFILE**				ppParseFileInputStream;		//0x459D4
 	DWORD**				pErrorsCount;				//0x459DC
 };
 
