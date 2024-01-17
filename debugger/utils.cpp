@@ -6,6 +6,7 @@
 struct HandleData {
     DWORD pid;
     HWND window;
+    HWND excluding;
 };
 
 DWORD nop(LPVOID address, SIZE_T size) {
@@ -21,28 +22,25 @@ DWORD nop(LPVOID address, SIZE_T size) {
     return GetLastError();
 }
 
-BOOL isMainWindow(HWND handle) {
-    return GetWindow(handle, GW_OWNER) == NULL && IsWindowVisible(handle);
-}
-
 BOOL CALLBACK enumWindowsCallback(HWND handle, LPARAM lParam) {
     HandleData& data = *(HandleData*)lParam;
     DWORD pid = 0;
     GetWindowThreadProcessId(handle, &pid);
-    if (data.pid != pid || !isMainWindow(handle)) {
+    if (data.pid != pid || handle == data.excluding) {
         return TRUE;
     }
     data.window = handle;
     return FALSE;
 }
 
-HWND findMainWindow(DWORD pid) {
+HWND findProcessWindowExcluding(DWORD pid, HWND excluding) {
     HandleData data;
     if (pid == NULL) {
         pid = GetCurrentProcessId();
     }
     data.pid = pid;
     data.window = 0;
+    data.excluding = excluding;
     EnumWindows(enumWindowsCallback, (LPARAM)&data);
     return data.window;
 }
@@ -117,6 +115,13 @@ bool isNumber(const std::string& str) {
     double val;
     iss >> val;
     return iss.eof() && !iss.fail();
+}
+
+const char* ltrim(const char* str) {
+    while (*str != 0 && (*str == ' ' || *str == '\t')) {
+        str++;
+    }
+    return str;
 }
 
 std::string strReplace(const std::string haystack, std::string needle, std::string replacement) {

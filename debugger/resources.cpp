@@ -4,6 +4,8 @@
 #include <map>
 #include <string>
 
+#include "ScriptLibraryR.h"
+
 const char* datatype_names[8] = {
 	"void", "int", "float", "coord", "Object", "Unk5", "bool", "float*"
 };
@@ -25,7 +27,7 @@ std::map<DWORD, std::string> scriptType_names = {
 	{32, "multiplayer help script"},
 };
 
-std::vector<std::string> opcode_keywords[45][3] = {
+std::vector<std::string> opcode_keywords[OPCODES_COUNT][3] = {
 	/* 0*/	{{"END"}},
 	/* 1*/	{{}, {"", "JZ"}, {"", "JZ"}},
 	/* 2*/	{{}, {"", "PUSHI", "PUSHF", "PUSHC", "PUSHO", "", "PUSHB", "PUSHV"}, {"", "", "PUSHF", "", "", "", "", "PUSHV"}},
@@ -57,7 +59,7 @@ std::vector<std::string> opcode_keywords[45][3] = {
 	/*28*/	{{}, {"", "BRKEXCEPT"}},
 	/*29*/	{{}, {"", "SWAP", "SWAPF"}},
 	/*30*/	{{"DUP"}},
-	/*31*/	{{}, {}, {"", "", "LINE"}},
+	/*31*/	{{}, {}, {"", "", "NOP"}},	//original name: LINE
 	/*32*/	{{}, {}, {"", "", "", "", "", "", "", "REF_AND_OFFSET_PUSH"}},
 	/*33*/	{{}, {}, {"", "", "REF_AND_OFFSET_POP"}},
 	/*34*/	{{}, {"", "", "", "", "", "", "", "REF_PUSH"}, {"", "", "", "", "", "", "", "REF_PUSH2"}},
@@ -73,14 +75,7 @@ std::vector<std::string> opcode_keywords[45][3] = {
 	/*44*/	{{"ABS"}}
 };
 
-constexpr auto OP_ATTR_ARG = 1;
-constexpr auto OP_ATTR_IP = 2 | OP_ATTR_ARG;
-constexpr auto OP_ATTR_SCRIPT = 4 | OP_ATTR_ARG;
-constexpr auto OP_ATTR_JUMP = 8 | OP_ATTR_ARG | OP_ATTR_IP;
-constexpr auto OP_ATTR_FINT = 16;
-constexpr auto OP_ATTR_VSTACK = 32;
-
-DWORD opcode_attrs[45] = {
+DWORD opcode_attrs[OPCODES_COUNT] = {
 	/* 0*/	0,
 	/* 1*/	OP_ATTR_JUMP,
 	/* 2*/	OP_ATTR_ARG,

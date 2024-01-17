@@ -1,6 +1,7 @@
 #include "dllmain.h"
 #include "bwfuncs.h"
 #include "ScriptLibraryR.h"
+#include "CHLFile.h"
 #include "debug.h"
 #include "gdb.h"
 
@@ -21,14 +22,17 @@
 #include <filesystem>
 #include <fstream>
 
-#include "logger.h"
+#undef __FILENAME__
 #undef LOG_LEVEL
 #undef PAUSE_ON
-#define LOG_LEVEL LL_INFO
-//#define PAUSE_ON LL_ERROR
+#define __FILENAME__ "dllmain.cpp"
+#define LOG_LEVEL 6
+#define PAUSE_ON 0
 #include "logger.h"
 
 ScriptLibraryRDll ScriptLibraryR;
+
+char chlFilename[MAX_PATH];
 
 char gamePath[MAX_PATH];
 std::set<std::string> sourcePath;
@@ -47,7 +51,6 @@ bool pause = false;
 
 Debugger* debugger;
 bool debugging = false;
-bool started = false;
 
 std::map<int, Script*> scripts;
 std::map<std::string, Script*> scriptsByName;
@@ -68,14 +71,19 @@ std::string parseTempFile = "";
 
 int allowedThreadId = 0;
 
-Var tmpLocals[4];
+int debugger_result_id;
+int debugger_result_x_id;
+int debugger_result_y_id;
+int debugger_result_z_id;
 
 bool gamePaused = false;
+
 
 int __cdecl errorCallback(DWORD severity, const char* msg);
 int getScriptSize(Script* script);
 bool relocateCode(int srcIp, int count, int dstIp);
 void collectGarbage();
+int __cdecl ScriptLibraryR_stopTask0(Task* pTask);
 
 
 void Fail(const char* a) {
@@ -126,26 +134,41 @@ void jump(Task* task, int ip) {
 	lastBreakLine = instr->linenumber;
 }
 
-const char* findStringData(std::string prefix, const char* after) {
-	const size_t prefixLen = prefix.length();
+size_t getOrDefineString(const char* str) {
+	const char* pData = findStringData(str, NULL, false);
+	if (pData == NULL) {
+		return ScriptLibraryR.addStringToDataSection(str);
+	}
+	return pData - *ScriptLibraryR.ppDataSection;
+}
+
+const char* findStringData(std::string needle, const char* after, bool prefix) {
+	const size_t prefixLen = needle.length();
 	const char* start = *ScriptLibraryR.ppDataSection;
 	if (after != NULL) {
 		start = after + strlen(after) + 1;
 	}
 	const char* end = *ScriptLibraryR.ppDataSection + *ScriptLibraryR.pDataSectionSize;
 	for (const char* str = start; str < end; str += strlen(str) + 1) {
-		if (strncmp(str, prefix.c_str(), prefixLen) == 0) {
-			return str;
+		if (prefix) {
+			if (strncmp(str, needle.c_str(), prefixLen) == 0) {
+				return str;
+			}
+		} else {
+			if (strcmp(str, needle.c_str()) == 0) {
+				return str;
+			}
 		}
 	}
 	return NULL;
 }
 
 bool getStoredHash(std::string filename, DWORD* outHash) {
-	const char* hashData = findStringData("crc32[" + filename + "]=", NULL);
+	const char* hashData = findStringData("crc32[" + filename + "]=", NULL, true);
 	if (hashData == NULL) return false;
 	const char* sHash = strchr(hashData, '=') + 1;
-	*outHash = (DWORD)atoll(sHash);
+	*outHash = (DWORD)strtoll(sHash, NULL, 16);
+	TRACE("string hash: %s, int hash: %08X", sHash, *outHash);
 	return true;
 }
 
@@ -160,7 +183,8 @@ int checkFileHash(std::string storedFilename, std::string sourceFilename) {
 		return -1;
 	}
 	if (storedHash != fileHash) {
-		debugger->onMessage(3, "File %s doesn't match with the stored hash.", sourceFilename.c_str());
+		debugger->onMessage(3, "File %s doesn't match with the stored hash (computed: %08X, found: %08X).",
+				sourceFilename.c_str(), fileHash, storedHash);
 		return -2;
 	}
 	return 0;
@@ -171,7 +195,7 @@ void setSource(std::string filename, std::vector<std::string> lines) {
 }
 
 void unsetSource(std::string filename) {
-	sources[filename] = std::vector<std::string>();
+	sources.erase(filename);
 }
 
 std::vector<std::string> getSource(std::string filename) {
@@ -245,6 +269,12 @@ Script* findScriptByIp(DWORD ip) {
 			resIp = script->instructionAddress;
 		}
 	}
+	if (res != NULL) {
+		const int size = getScriptSize(res);
+		if (ip >= res->instructionAddress + size) {
+			res = NULL;
+		}
+	}
 	return res;
 }
 
@@ -267,23 +297,22 @@ int findInstruction(DWORD startIp, DWORD opcode) {
 
 void formatVar(Script* script, int id, char* buffer) {
 	if (id > (int)script->globalsCount) {
-		id -= script->globalsCount + 1;
-		StringVector* pVars = &script->localVars;
-		char** pName = pVars->pFirst[id];
-		if (streq(*pName, "LHVMA")) {
+		int index = id - script->globalsCount - 1;
+		VarDeclVector* pVars = &script->localVars;
+		VarDecl** pVar = pVars->pFirst + index;
+		if (streq((*pVar)->name, "LHVMA")) {
 			int index = 0;
 			do {
-				id--;
 				index++;
-				pName = pVars->pFirst[id];
-			} while (streq("LHVMA", *pName));
-			strcpy(buffer, *pName);
+				pVar--;
+			} while (streq("LHVMA", (*pVar)->name));
+			strcpy(buffer, (*pVar)->name);
 			strcat(buffer, "+");
 			_itoa(index, &buffer[strlen(buffer)], 10);
 		} else {
-			strcpy(buffer, *pName);
-			id++;
-			if (id < pVars->pEnd - pVars->pFirst && streq("LHVMA", *pVars->pFirst[id])) {
+			strcpy(buffer, (*pVar)->name);
+			pVar++;
+			if (pVar < pVars->pEnd && streq("LHVMA", (*pVar)->name)) {
 				strcat(buffer, "+0");
 			}
 		}
@@ -353,6 +382,14 @@ void formatInstruction(Script* script, Instruction* instr, char* buffer) {
 		if (opcode == SYS) {
 			const char* name = NativeFunctions[intVal];
 			strcat(buffer, name);
+		} else if (opcode == CALL) {
+			Script* script = getScriptById(intVal);
+			if (script != NULL) {
+				strcat(buffer, script->name);
+			} else {
+				_itoa(intVal, &buffer[strlen(buffer)], 10);
+				strcat(buffer, "	//script not found");
+			}
 		} else if (isRef) {
 			if (instr->datatype == DT_VAR) {
 				intVal = (int)instr->floatVal;
@@ -475,11 +512,11 @@ int parseNameAndIndex(const char* expr, char* outName) {
 
 int getLocalVarId(Script* script, const char* name, int index) {
 	int i = 0;
-	for (char*** ppVar = script->localVars.pFirst; ppVar < script->localVars.pEnd; ppVar++, i++) {
-		if (streq(**ppVar, name)) {
+	for (VarDecl** pVar = script->localVars.pFirst; pVar < script->localVars.pEnd; pVar++, i++) {
+		if (streq((*pVar)->name, name)) {
 			const int localCount = script->localVars.pEnd - script->localVars.pFirst;
 			for (int j = 1; j <= index; j++) {
-				if (i + j >= localCount || !streq(*script->localVars.pFirst[i + j], "LHVMA")) {
+				if (i + j >= localCount || !streq(script->localVars.pFirst[i + j]->name, "LHVMA")) {
 					debugger->onMessage(3, "Index %i out of bounds for variable '%s'", index, name);
 					return INDEX_OUT_OF_BOUNDS;
 				}
@@ -489,6 +526,23 @@ int getLocalVarId(Script* script, const char* name, int index) {
 	}
 	TRACE("Symbol '%s' is not a local variable in script %s", name, script->name);
 	return -1;
+}
+
+std::list<VarDef> getGlobalVarDefs() {
+	std::list<VarDef> res;
+	VarDef nullDef = VarDef(0, "");
+	VarDef* def = &nullDef;
+	int id = 0;
+	for (Var* var = ScriptLibraryR.globalVars->pFirst; var < ScriptLibraryR.globalVars->pEnd; var++) {
+		if (streq(var->name, "LHVMA")) {
+			def->size++;
+		} else {
+			res.push_back(VarDef(id, var->name));
+			def = &res.back();
+		}
+		id++;
+	}
+	return res;
 }
 
 int getGlobalVarId(const char* name, int index) {
@@ -619,6 +673,14 @@ int getGlobalVarsCount() {
 	return ScriptLibraryR.globalVars->pEnd - ScriptLibraryR.globalVars->pFirst;
 }
 
+Var* getGlobalVarById(int id) {
+	const int count = ScriptLibraryR.globalVars->pEnd - ScriptLibraryR.globalVars->pFirst;
+	if (id >= 0 && id < count) {
+		return ScriptLibraryR.globalVars->pFirst + id;
+	}
+	return NULL;
+}
+
 Var* getGlobalVar(const char* name) {
 	for (Var* var = ScriptLibraryR.globalVars->pFirst; var < ScriptLibraryR.globalVars->pEnd; var++) {
 		if (streq(var->name, name)) {
@@ -628,18 +690,37 @@ Var* getGlobalVar(const char* name) {
 	return NULL;
 }
 
-int declareGlobalVar(const char* name) {
+int declareGlobalVar(const char* name, size_t size) {
 	int id = getGlobalVarId(name, 0);
 	if (id >= 0) {
-		ERR("variable '%s' already exists", name);
+		debugger->onMessage(3, "variable '%s' already exists", name);
 		return -1;
 	}
-	id = ScriptLibraryR.createVar(name, DT_FLOAT, NULL, TRUE);
-	ScriptLibraryR.setVarType(VAR_TYPE_ATOMIC, id);
+	if (size < 1) {
+		debugger->onMessage(3, "invalid size");
+		return -1;
+	} else if (size == 1) {
+		id = ScriptLibraryR.createVar(name, DT_FLOAT, NULL, TRUE);
+		ScriptLibraryR.setVarType(VAR_TYPE_ATOMIC, id);
+		TRACE("global variable '%s' added", name);
+	} else {
+		id = ScriptLibraryR.createArray(name, DT_FLOAT, size, TRUE);
+		ScriptLibraryR.setVarType(VAR_TYPE_ARRAY, id);
+		TRACE("global variable '%s[%i]' added", name, size);
+	}
+	return id;
+}
+
+int getOrDeclareGlobalVar(const char* name, size_t size) {
+	int id = getGlobalVarId(name, 0);
+	if (id < 0) {
+		id = declareGlobalVar(name, size);
+	}
 	return id;
 }
 
 Task* getInnermostFrame(Task* task) {
+	if (task == NULL) return NULL;
 	while (task->waitingTask != 0) {
 		task = getTaskById(task->waitingTask);
 	}
@@ -728,7 +809,7 @@ Instruction* getCurrentInstruction(Task* task) {
 }
 
 Instruction* getInstruction(int ip) {
-	return &ScriptLibraryR.instructions->pFirst[ip];
+	return ScriptLibraryR.instructions->pFirst + ip;
 }
 
 void initVarTypes() {
@@ -766,9 +847,13 @@ void onChlLoaded() {
 	gamePaused = false;
 	//
 	initVarTypes();
+	debugger_result_id = getOrDeclareGlobalVar("__debugger_result", 1);
+	debugger_result_x_id = getOrDeclareGlobalVar("__debugger_result_x", 1);
+	debugger_result_y_id = getOrDeclareGlobalVar("__debugger_result_y", 1);
+	debugger_result_z_id = getOrDeclareGlobalVar("__debugger_result_z", 1);
 	//
 	DEBUG("searching for source directories in CHL");
-	const char* source_dirs = findStringData("source_dirs=", NULL);
+	const char* source_dirs = findStringData("source_dirs=", NULL, true);
 	if (source_dirs != NULL) {
 		char buffer[2048];
 		strcpy(buffer, strchr(source_dirs, '=') + 1);
@@ -781,6 +866,8 @@ void onChlLoaded() {
 			}
 		}
 	}
+	//
+	debugger->start();
 }
 
 
@@ -788,6 +875,7 @@ int ScriptLibraryR_LoadBinary(int a1, char* FileName) {
 	DEBUG("LoadBinary(%i, \"%s\")", a1, FileName);
 	cleanup();
 	int r = ScriptLibraryR.LoadBinary(a1, FileName);
+	strcpy(chlFilename, FileName);
 	onChlLoaded();
 	return r;
 }
@@ -804,7 +892,7 @@ int ScriptLibraryR_RestoreState(int a1, char* FileName) {
 		if (task->waitingTask > 0) {
 			tasksParents[task->waitingTask] = task;
 		}
-		TaskInfo* info = new TaskInfo();
+		TaskInfo* info = new TaskInfo(task->taskNumber, task->name);
 		info->exceptionMatched = false;	//TODO
 		tasksInfo[task->taskNumber] = info;
 	}
@@ -820,7 +908,7 @@ int ScriptLibraryR_RestoreState(int a1, char* FileName) {
 	return r;
 }
 
-int ScriptLibraryR_StartScript(int a1, char* scriptName, int allowedScriptTypesBitmask) {
+int ScriptLibraryR_StartScript(int a1, const char* scriptName, int allowedScriptTypesBitmask) {
 	DEBUG("StartScript(%i, \"%s\", %X)", a1, scriptName, allowedScriptTypesBitmask);
 	int r = ScriptLibraryR.StartScript(a1, scriptName, allowedScriptTypesBitmask);
 	return r;
@@ -961,11 +1049,17 @@ char __cdecl ScriptLibraryR_lhvmCpuLoop(Task* task) {	//at 0x8DA0
 			if (allowedThreadId != 0 && getThread(task)->taskNumber != allowedThreadId) {
 				break;
 			}
+			if (*ScriptLibraryR.ppCurrentStack == ScriptLibraryR.pMainStack) {
+				break;						//Task is dead
+			}
 			++scriptInstructionCount;
 			Instruction& instruction = ScriptLibraryR.instructions->pFirst[task->ip];
 			OpcodeImpl opcodeImpl = ScriptLibraryR.opcodesImpl[instruction.opcode];
 			opcodeImpl(currentTask, &instruction);
 			debugger_execute_post(task);	//hook out
+			if (*ScriptLibraryR.ppCurrentStack == ScriptLibraryR.pMainStack) {
+				break;						//Task is dead
+			}
 			if (task->stop)
 				break;
 			if (task->stopExceptionHandler)
@@ -982,6 +1076,14 @@ char __cdecl ScriptLibraryR_lhvmCpuLoop(Task* task) {	//at 0x8DA0
 	return 0;
 }
 
+std::list<Script*> getScripts() {
+	std::list<Script*> res;
+	for (ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
+		res.push_back(scriptEntry->script);
+	}
+	return res;
+}
+
 Script* getScriptById(int scriptId) {
 	if (!scripts.contains(scriptId)) {
 		for (ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
@@ -991,6 +1093,7 @@ Script* getScriptById(int scriptId) {
 				return script;
 			}
 		}
+		return NULL;
 	}
 	return scripts[scriptId];
 }
@@ -1004,6 +1107,7 @@ Script* getScriptByName(std::string name) {
 				return script;
 			}
 		}
+		return NULL;
 	}
 	return scriptsByName[name];
 }
@@ -1013,17 +1117,18 @@ Script* getTaskScript(Task* task) {
 	return getScriptById(task->scriptID);
 }
 
-bool isScriptRunning(int scriptId) {
+Task* isScriptRunning(int scriptId) {
 	for (TaskEntry* entry = *ScriptLibraryR.pTaskList; entry != NULL; entry = entry->next) {
 		Task* task = entry->task;
 		if (task->scriptID == scriptId) {
-			return true;
+			return task;
 		}
 	}
-	return false;
+	return NULL;
 }
 
 void deleteScript0(Script* script, bool releaseCode) {
+	scriptsByName.erase(script->name);
 	if (releaseCode) {
 		const int scriptSize = getScriptSize(script);
 		DEBUG("marking instructions %i -> %i as free space", script->instructionAddress, script->instructionAddress + scriptSize);
@@ -1224,10 +1329,10 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	if (script != NULL && script->localVars.pEnd - script->localVars.pFirst > 0) {
 		TRACE("copying local variables");
 		char* writePos = localDecl;
-		const char* lastName = **script->localVars.pFirst;
+		const char* lastName = (*script->localVars.pFirst)->name;
 		int size = 1;
-		for (char*** ppVarName = script->localVars.pFirst + 1; ppVarName <= script->localVars.pEnd; ppVarName++) {
-			const char* varName = ppVarName < script->localVars.pEnd ? **ppVarName : "";
+		for (VarDecl** pVar = script->localVars.pFirst + 1; pVar <= script->localVars.pEnd; pVar++) {
+			const char* varName = pVar < script->localVars.pEnd ? (*pVar)->name : "";
 			if (streq(varName, "LHVMA")) {
 				size++;
 			} else {
@@ -1256,33 +1361,27 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	const char* codeTemplate;
 	switch (datatype) {
 		case DT_FLOAT:
-			initLocalCount += 1;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
-				"	__debugger_result = 0\n"
 				"start\n"
 				"%3$s"
 				"	__debugger_result = %4$s\n"
 				"end script %1$s";
 			break;
 		case DT_INT:
-			initLocalCount += 1;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
-				"	__debugger_result = 0\n"
 				"start\n"
 				"%3$s"
 				"	__debugger_result = variable %4$s\n"
 				"end script %1$s";
 			break;
 		case DT_BOOLEAN:
-			initLocalCount += 1;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
-				"	__debugger_result = 0\n"
 				"start\n"
 				"%3$s"
 				"	__debugger_result = 0\n"
@@ -1292,14 +1391,9 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 				"end script %1$s";
 			break;
 		case DT_COORDS:
-			initLocalCount += 4;
 			codeTemplate =
 				"begin script %1$s\n"
 				"%2$s"
-				"	__debugger_result = 0\n"
-				"	__debugger_result_x = 0\n"
-				"	__debugger_result_y = 0\n"
-				"	__debugger_result_z = 0\n"
 				"start\n"
 				"%3$s"
 				"	__debugger_result = marker at (%4$s)\n"
@@ -1541,6 +1635,46 @@ Expression* getCompiledExpression(Script* script, std::string expression, int da
 	return cache[expression];
 }
 
+int addLocalVar(Task* task, const char* name, float value, size_t size) {
+	Script* script = getTaskScript(task);
+	for (Var* var = task->localVars.pFirst; var < task->localVars.pEnd; var++) {
+		if (streq(var->name, name)) {
+			return -1;
+		}
+	}
+	const int taskLocalVarsCount = getLocalVarsCount(task);
+	const int taskLocalVarsSize = task->localVars.pBufferEnd - task->localVars.pFirst;
+	const int requiredVarsCount = taskLocalVarsCount + size;
+	if (taskLocalVarsSize < requiredVarsCount) {
+		const int bytes = sizeof(Var) * requiredVarsCount;
+		Var* newLocalVars = (Var*)ScriptLibraryR.operator_new(bytes);
+		if (newLocalVars == NULL) {
+			ERR("failed to allocate %i bytes", bytes);
+			return -1;
+		}
+		if (taskLocalVarsCount > 0) {
+			for (int i = 0; i < taskLocalVarsCount; i++) {
+				newLocalVars[i] = task->localVars.pFirst[i];
+			}
+			ScriptLibraryR.free0(task->localVars.pFirst);
+		}
+		task->localVars.pFirst = newLocalVars;
+		task->localVars.pEnd = newLocalVars + requiredVarsCount;
+		task->localVars.pBufferEnd = newLocalVars + requiredVarsCount;
+	}
+	Var* var = task->localVars.pFirst + taskLocalVarsCount;
+	var->name = ScriptLibraryR._strdup(name);
+	var->type = DataTypes::DT_FLOAT;
+	var->floatVal = value;
+	for (int i = 1; i < (int)size; i++) {
+		var++;
+		var->name = "LHVMA";
+		var->type = DataTypes::DT_FLOAT;
+		var->floatVal = value;
+	}
+	return taskLocalVarsCount;
+}
+
 Var* evalExpression(Task* context, Expression* expr) {
 	TRACE("evaluating expression '%s' at address %i", expr->str.c_str(), expr->instructionAddress);
 	if (expr->varId >= 0) {
@@ -1549,58 +1683,12 @@ Var* evalExpression(Task* context, Expression* expr) {
 	Task evalTask;
 	const int addedVarsCount = expr->datatype == DT_COORDS ? 4 : 1;
 	evalTask.globalsCount = expr->globalsCount;
-	int scriptLocalVarsCount = 0;
-	if (context != NULL) {
-		Script* script = getTaskScript(context);
-		scriptLocalVarsCount = script->localVars.pEnd - script->localVars.pFirst;
-		const int taskLocalVarsCount = getLocalVarsCount(context);
-		const int requiredVarsCount = scriptLocalVarsCount + addedVarsCount;
-		if (taskLocalVarsCount < requiredVarsCount) {
-			const int bytes = sizeof(Var) * requiredVarsCount;
-			Var* newLocalVars = (Var*)ScriptLibraryR.operator_new(bytes);
-			if (newLocalVars == NULL) {
-				ERR("failed to allocate %i bytes", bytes);
-				return NULL;
-			}
-			if (taskLocalVarsCount > 0) {
-				for (int i = 0; i < taskLocalVarsCount; i++) {
-					newLocalVars[i] = context->localVars.pFirst[i];
-				}
-				ScriptLibraryR.free0(context->localVars.pFirst);
-			}
-			context->localVars.pFirst = newLocalVars;
-			context->localVars.pEnd = newLocalVars + requiredVarsCount;
-			context->localVars.pBufferEnd = newLocalVars + requiredVarsCount;
-		}
-		evalTask.localVars.pFirst = context->localVars.pFirst;
-		evalTask.localVars.pEnd = context->localVars.pEnd;
-		evalTask.localVars.pBufferEnd = context->localVars.pBufferEnd;
-	} else {
-		evalTask.localVars.pFirst = tmpLocals;
-		evalTask.localVars.pEnd = tmpLocals + addedVarsCount;
-		evalTask.localVars.pBufferEnd = tmpLocals + addedVarsCount;
-	}
 	//
 	Var* result;
 	if (expr->datatype == DT_COORDS) {
-		result = evalTask.localVars.pFirst + scriptLocalVarsCount + 1;	//__debugger_result_x
-		result[-1].name = "__debugger_result";	//No need to call _strdup, calling free on static memory has no effect!
-		result[-1].type = DT_FLOAT;
-		result[-1].floatVal = NAN;
-		result[0].name = "__debugger_result_x";
-		result[0].type = DT_FLOAT;
-		result[0].floatVal = NAN;
-		result[1].name = "__debugger_result_y";
-		result[1].type = DT_FLOAT;
-		result[1].floatVal = NAN;
-		result[2].name = "__debugger_result_z";
-		result[2].type = DT_FLOAT;
-		result[2].floatVal = NAN;
+		result = getVarById(NULL, debugger_result_x_id);
 	} else {
-		result = evalTask.localVars.pFirst + scriptLocalVarsCount;
-		result->name = "__debugger_result";
-		result->type = DT_FLOAT;
-		result->floatVal = NAN;
+		result = getVarById(NULL, debugger_result_id);
 	}
 	//
 	evalTask.currentExceptionHandlerIndex = 0;
@@ -1645,9 +1733,10 @@ Var* evalExpression(Task* context, Expression* expr) {
 
 Var* evalString(Task* context, std::string expression, int& datatype) {
 	if (isNumber(expression)) {
+		Var* result = getVarById(NULL, debugger_result_id);
 		datatype = DT_FLOAT;
-		tmpLocals[0].floatVal = (FLOAT)atof(expression.c_str());
-		return tmpLocals;
+		result->floatVal = (FLOAT)atof(expression.c_str());
+		return result;
 	}
 	Script* script = getTaskScript(context);
 	if (datatype != DT_COORDS) {
@@ -1661,6 +1750,412 @@ Var* evalString(Task* context, std::string expression, int& datatype) {
 	if (expr == NULL) return NULL;
 	datatype = expr->datatype;
 	return evalExpression(context, expr);
+}
+
+CHLFile makeCHL() {
+	CHLFile chl;
+	//Global variables
+	for (Var* var = ScriptLibraryR.globalVars->pFirst + 1; var < ScriptLibraryR.globalVars->pEnd; var++) {
+		chl.globalVariables.names.push_back(var->name);
+	}
+	//Instructions
+	chl.instructions = *ScriptLibraryR.instructions;
+	//Autostart scripts
+	for (AutostartScriptEntry* entry = ScriptLibraryR.pAutostartScriptsList->first; entry != NULL; entry = entry->next) {
+		chl.autoStartScripts.items.push_back(entry->scriptId);
+	}
+	//Scripts
+	for (ScriptEntry* entry = *ScriptLibraryR.pScriptList; entry != NULL; entry = entry->next) {
+		Script* script = entry->script;
+		const int index = script->id - 1;
+		if ((int)chl.scriptsSection.items.size() <= index) {
+			chl.scriptsSection.items.resize(index + 1);
+		}
+		UScript uscript = UScript();
+		uscript.chl = &chl;
+		uscript.name = std::string(script->name);
+		uscript.sourceFilename = std::string(script->filename);
+		uscript.scriptType = script->type;
+		uscript.globalCount = script->globalsCount;
+		int count = script->localVars.pEnd - script->localVars.pFirst;
+		uscript.variables.reserve(count);
+		for (VarDecl** pVar = script->localVars.pFirst; pVar < script->localVars.pEnd; pVar++) {
+			uscript.variables.push_back((*pVar)->name);
+		}
+		uscript.instructionAddress = script->instructionAddress;
+		uscript.parameterCount = script->parameterCount;
+		uscript.scriptID = script->id;
+		uscript.finalize();
+		chl.scriptsSection.items[index] = uscript;
+	}
+	//Data section
+	chl.data.data = *ScriptLibraryR.ppDataSection;
+	chl.data.size = *ScriptLibraryR.pDataSectionSize;
+	//Task vars: must be empty
+	//Init globals: original values are overwritten during execution, sorry
+	return chl;
+}
+
+bool stopThread(Task* thread) {
+	if (thread == NULL) return false;
+	DEBUG("stopping thread %i", thread->taskNumber);
+	Task* task = getInnermostFrame(thread);
+	while (task != NULL) {
+		Task* parent = getParentFrame(task);
+		DEBUG("  stopping task %i (%s)", task->taskNumber, task->name);
+		//ScriptLibraryR.stopTask0(task);	we must call the detour function
+		ScriptLibraryR_stopTask0(task);
+		task = parent;
+	}
+	return true;
+}
+
+Script* createOrUpdateScript(UScript* uscript) {
+	Script* script = getScriptByName(uscript->name);
+	const bool isNew = script == NULL;
+	if (isNew) {
+		DEBUG("adding new script '%s'", uscript->name.c_str());
+		script = (Script*)ScriptLibraryR.operator_new(sizeof(Script));
+		if (script == NULL) {
+			ERR("failed to allocate %u bytes", sizeof(Script));
+			return NULL;
+		}
+		script->name = ScriptLibraryR._strdup(uscript->name.c_str());
+		script->filename = ScriptLibraryR._strdup(uscript->sourceFilename.c_str());
+	} else {
+		DEBUG("updating script '%s'", uscript->name.c_str());
+		if (script->localVars.pFirst != 0) {
+			DEBUG("deallocating old local variables buffer");
+			for (VarDecl** pVar = script->localVars.pFirst; pVar < script->localVars.pEnd; pVar++) {
+				ScriptLibraryR.free0(*pVar);
+			}
+			ScriptLibraryR.free0(script->localVars.pFirst);
+			script->localVars.pFirst = 0;
+			script->localVars.pEnd = 0;
+			script->localVars.pBufferEnd = 0;
+		}
+		const int scriptSize = getScriptSize(script);
+		DEBUG("marking instructions %i -> %i as free space", script->instructionAddress, script->instructionAddress + scriptSize);
+		memoryManager.addFreeSpace(script->instructionAddress, scriptSize);
+	}
+	script->type = uscript->scriptType;
+	script->globalsCount = getGlobalVarsCount();
+	int varsCount = uscript->variables.size();
+	if (varsCount == 0) {
+		DEBUG("script has no local variables, no need to allocate space");
+		script->localVars.pFirst = 0;
+		script->localVars.pEnd = 0;
+		script->localVars.pBufferEnd = 0;
+	} else {
+		DEBUG("allocating new local variables buffer");
+		size_t bytes = sizeof(void*) * varsCount;
+		script->localVars.pFirst = (VarDecl**)ScriptLibraryR.operator_new(bytes);
+		if (script->localVars.pFirst == NULL) {
+			debugger->onMessage(3, "failed to allocate %u bytes", bytes);
+			return NULL;
+		}
+		script->localVars.pEnd = script->localVars.pFirst + varsCount;
+		script->localVars.pBufferEnd = script->localVars.pFirst + varsCount;
+		VarDecl** pVar = script->localVars.pFirst;
+		for (auto name : uscript->variables) {
+			*pVar = (VarDecl*)ScriptLibraryR.operator_new(sizeof(VarDecl));
+			if (*pVar == NULL) {
+				script->localVars.pEnd = pVar;
+				debugger->onMessage(3, "failed to allocate %u bytes", sizeof(VarDecl));
+				return NULL;
+			}
+			(*pVar)->name = ScriptLibraryR._strdup(name.c_str());
+			(*pVar)->scriptName = script->name;
+			pVar++;
+		}
+	}
+	const int scriptSize = uscript->getInstructionsCount();
+	int address = memoryManager.getFreeSpace(scriptSize);
+	if (address < 0) {
+		const int spaceAvailable = ScriptLibraryR.instructions->pBufferEnd - ScriptLibraryR.instructions->pEnd;
+		if (spaceAvailable < scriptSize) {
+			DEBUG("allocating new instructions buffer");
+			const int currentInstructionsCount = getTotalInstructions();
+			const int totalRequiredSpace = currentInstructionsCount + scriptSize;
+			const size_t bytes = sizeof(Instruction) * totalRequiredSpace;
+			Instruction* newBuffer = (Instruction*)ScriptLibraryR.operator_new(bytes);
+			if (newBuffer == NULL) {
+				debugger->onMessage(3, "failed to allocate %u bytes", bytes);
+				return NULL;
+			}
+			memcpy(newBuffer, ScriptLibraryR.instructions->pFirst, sizeof(Instruction) * currentInstructionsCount);
+			ScriptLibraryR.free0(ScriptLibraryR.instructions->pFirst);
+			ScriptLibraryR.instructions->pFirst = newBuffer;
+			ScriptLibraryR.instructions->pEnd = newBuffer + currentInstructionsCount;
+			ScriptLibraryR.instructions->pBufferEnd = newBuffer + totalRequiredSpace;
+		}
+		address = ScriptLibraryR.instructions->pEnd - ScriptLibraryR.instructions->pFirst;
+		ScriptLibraryR.instructions->pEnd += scriptSize;
+	}
+	DEBUG("relocating code from %i to %i", uscript->instructionAddress, address);
+	int offset = address - uscript->instructionAddress;
+	int srcAddr = uscript->instructionAddress;
+	auto stringInstructionIt = uscript->getFirstStringInstruction();
+	const auto stringInstructionEnd = uscript->chl->getStringInstructions().end();
+	int stringInstr = stringInstructionIt != stringInstructionEnd ? *stringInstructionIt : 0x7FFFFFFF;
+	TRACE("first instruction to compare as string reference: %u", stringInstr);
+	Instruction* src = uscript->chl->instructions.pFirst + srcAddr;
+	Instruction* instr = getInstruction(address);
+	for (int i = 0; i < scriptSize; i++, srcAddr++, src++, instr++) {
+		//TRACE("relocating instruction %i", srcAddr);
+		*instr = *src;
+		int opcode = instr->opcode;
+		int flags = instr->flags;
+		DWORD attr = opcode_attrs[opcode];
+		if (opcode == END) {
+			break;
+		} else if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
+			instr->intVal += offset;
+		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (flags == 2 || instr->datatype == DataTypes::DT_VAR)) {
+			int varId = instr->datatype == DataTypes::DT_VAR ? (int)instr->floatVal : instr->intVal;
+			if (varId <= uscript->globalCount) {
+				int index = 0;
+				std::string& name = uscript->chl->globalVariables.names[--varId];
+				while (name == "LHVMA") {
+					varId--;
+					index++;
+					if (varId < 0) {
+						debugger->onMessage(4, "Fatal error: array without base");
+						varId = 0;
+					}
+					name = uscript->chl->globalVariables.names[varId - 1];
+				}
+				varId = getGlobalVarId(name.c_str(), index);
+				if (varId < 0) {
+					debugger->onMessage(4, "Fatal error: cannot find global variable '%s'", name.c_str());
+					varId = 0;
+				} else {
+					TRACE("instruction %i references global var '%s'", srcAddr, name.c_str());
+				}
+			} else {
+				varId = varId - uscript->globalCount + script->globalsCount;
+			}
+			if (instr->datatype == DataTypes::DT_VAR) {
+				instr->floatVal = (float)varId;
+			} else {
+				instr->intVal = varId;
+			}
+		} else if (instr->datatype == DataTypes::DT_INT) {
+			while (srcAddr > stringInstr) {
+				stringInstructionIt++;
+				stringInstr = stringInstructionIt != stringInstructionEnd ? *stringInstructionIt : 0x7FFFFFFF;
+				TRACE("next instruction to compare as string reference: %u", stringInstr);
+			}
+			if (srcAddr == stringInstr) {
+				TRACE("comparing instruction %u as string reference", srcAddr);
+				const char* str = uscript->chl->data.getString(instr->intVal);
+				const char* newStr = findStringData(str, NULL, false);
+				if (newStr == NULL) {
+					debugger->onMessage(4, "Fatal error: cannot find string '%s'", str);
+					instr->intVal = 0;
+				} else {
+					instr->intVal = newStr - *ScriptLibraryR.ppDataSection;
+					TRACE("string '%s' found at offset %u", str, instr->intVal);
+				}
+			}
+		}
+	}
+	TRACE("code relocation completed");
+	//
+	script->instructionAddress = address;
+	script->parameterCount = uscript->parameterCount;
+	if (isNew) {
+		script->id = ++(*ScriptLibraryR.pHighestScriptId);
+		ScriptEntry* newEntry = (ScriptEntry*)ScriptLibraryR.operator_new(sizeof(ScriptEntry));
+		newEntry->script = script;
+		newEntry->next = NULL;
+		ScriptEntry* entry = *ScriptLibraryR.pScriptList;
+		ScriptEntry* lastEntry = NULL;
+		while (entry != NULL) {
+			lastEntry = entry;
+			entry = entry->next;
+		}
+		if (lastEntry != NULL) {
+			lastEntry->next = newEntry;
+		} else {
+			*ScriptLibraryR.pScriptList = newEntry;
+		}
+		++(*ScriptLibraryR.pScriptsCount);
+		debugger->onMessage(1, "script '%s' added (ID remapped from %i to %i)", script->name, uscript->scriptID, script->id);
+	} else {
+		debugger->onMessage(1, "script '%s' updated", script->name);
+	}
+	return script;
+}
+
+bool updateCHL(const char* filename) {
+	if (filename == NULL) {
+		filename = chlFilename;
+		DEBUG("updating CHL from '%s'", filename);
+	}
+	CHLFile file1 = makeCHL();
+	CHLFile file2;
+	if (!file2.read(filename)) {
+		debugger->onMessage(3, "failed to read '%s'", filename);
+		return false;
+	}
+	CHLDiff diff = CHLDiff(&file1, &file2);
+	//Clear old debug info
+	DEBUG("clearing old debug info");
+	char* string_instructions = (char*)findStringData("string_instructions=", NULL, true);
+	if (string_instructions != NULL) {
+		memset(string_instructions, 0, strlen(string_instructions));
+	}
+	for (auto name : diff.sources.removed) {
+		char* crc = (char*)findStringData("crc32[" + name + "]=", NULL, true);
+		if (crc != NULL) {
+			memset(crc, 0, strlen(crc));
+			TRACE("CRC removed for source file '%s'", name.c_str());
+		}
+		unsetSource(name);
+	}
+	for (auto name : diff.sources.changed) {
+		char* crc = (char*)findStringData("crc32[" + name + "]=", NULL, true);
+		if (crc != NULL) {
+			const char* newCrc = file2.data.findByPrefix("crc32[" + name + "]=");
+			if (newCrc != NULL && strlen(newCrc) == strlen(crc)) {
+				strcpy(crc, newCrc);
+				TRACE("CRC updated for source file '%s'", name.c_str());
+			} else {
+				memset(crc, 0, strlen(crc));
+			}
+		}
+		unsetSource(name);
+	}
+	for (auto name : diff.sources.added) {
+		const char* newCrc = file2.data.findByPrefix("crc32[" + name + "]=");
+		if (newCrc != NULL) {
+			ScriptLibraryR.addStringToDataSection(newCrc);
+		}
+	}
+	//Add new Data
+	DEBUG("adding %i new strings", diff.data.added.size());
+	for (auto str : diff.data.added) {
+		if (str.starts_with("crc32[")) {
+			//CRCs are added above
+		} else if (str.starts_with("source_dirs=")) {
+			char buffer[2048];
+			strcpy(buffer, strchr(str.c_str(), '=') + 1);
+			char* dirs[32];
+			const int nDirs = splitArgs(buffer, ';', dirs, 32);
+			for (int i = 0; i < nDirs; i++) {
+				if (!sourcePath.contains(dirs[i])) {
+					sourcePath.insert(dirs[i]);
+					printf("Path '%s' added to source path\n", dirs[i]);
+				}
+			}
+		} else {
+			int offset = ScriptLibraryR.addStringToDataSection(str.c_str());
+			TRACE("string added at %i: '%s'", offset, str.c_str());
+		}
+	}
+	//Remove deleted vars
+	//	too risky, skip
+	//Update changed vars (resizing)
+	for (auto var : diff.globalVars.changed) {
+		size_t p = var.find('/');
+		std::string name = var.substr(0, p);
+		int size = atoi(var.c_str() + p + 1);
+		//TODO
+		debugger->onMessage(3, "changing size of global variables is not supported (%s)", name.c_str());
+		return false;
+	}
+	//Add new global vars
+	DEBUG("adding %i new global variables", diff.globalVars.added.size());
+	for (auto var : diff.globalVars.added) {
+		size_t p = var.find('/');
+		std::string name = var.substr(0, p);
+		int size = atoi(var.c_str() + p + 1);
+		int newId = declareGlobalVar(name.c_str(), size);
+		if (newId < 0) {
+			debugger->onMessage(3, "failed to add global variable '%s'", name.c_str());
+			return false;
+		} else {
+			TRACE("global variable '%s' added with ID %i", name.c_str(), newId);
+		}
+	}
+	//Remove deleted scripts
+	DEBUG("removing %i deleted scripts", diff.scripts.removed.size());
+	for (auto name : diff.scripts.removed) {
+		Script* script = getScriptByName(name);
+		while (Task* task = isScriptRunning(script->id)) {
+			Task* thread = getThread(task);
+			DEBUG("script '%s' in use by thread %i", script->name, thread->taskNumber);
+			if (!stopThread(thread)) {
+				debugger->onMessage(3, "failed to stop thread");
+				return false;
+			}
+		}
+		deleteScriptByName(script->name);
+		DEBUG("script '%s' deleted", name.c_str());
+	}
+	//Update changed scripts
+	DEBUG("updating %i changed scripts", diff.scripts.changed.size());
+	std::list<Script*> updatedScripts;
+	for (auto name : diff.scripts.changed) {
+		Script* script = getScriptByName(name);
+		//Stop all threads using the script
+		while (Task* task = isScriptRunning(script->id)) {
+			Task* thread = getThread(task);
+			DEBUG("script '%s' in use by thread %i", script->name, thread->taskNumber);
+			if (!stopThread(thread)) {
+				debugger->onMessage(3, "failed to stop thread");
+				return false;
+			}
+		}
+		//Update the script
+		UScript* uscript = file2.scriptsSection.findScript(name);
+		if (createOrUpdateScript(uscript) == NULL) {
+			return false;
+		}
+		updatedScripts.push_back(script);
+	}
+	//Add new scripts
+	DEBUG("adding %i new scripts", diff.scripts.added.size());
+	for (auto name : diff.scripts.added) {
+		UScript* uscript = file2.scriptsSection.findScript(name);
+		Script* script = createOrUpdateScript(uscript);
+		if (script == NULL) {
+			return false;
+		}
+		updatedScripts.push_back(script);
+	}
+	//Update scripts instructions
+	DEBUG("updating instructions in %i scripts", updatedScripts.size());
+	for (Script* script : updatedScripts) {
+		int index = script->instructionAddress;
+		for (Instruction* instr = ScriptLibraryR.instructions->pFirst + script->instructionAddress; instr < ScriptLibraryR.instructions->pEnd; instr++, index++) {
+			int opcode = instr->opcode;
+			DWORD attr = opcode_attrs[opcode];
+			if (opcode == END) {
+				break;
+			} else if ((attr & OP_ATTR_SCRIPT) == OP_ATTR_SCRIPT) {
+				const int oldVal = instr->intVal;
+				UScript* targetUScript = file2.scriptsSection.getScriptById(oldVal);
+				if (targetUScript == NULL) {
+					ERR("script %i not found in new file", oldVal);
+					return false;
+				}
+				Script* targetScript = getScriptByName(targetUScript->name);
+				if (targetScript == NULL) {
+					ERR("script '%s' not found", targetUScript->name.c_str());
+					return false;
+				}
+				if (instr->intVal != targetScript->id) {
+					instr->intVal = targetScript->id;
+					TRACE("script ID changed from %i to %i at instruction %i", oldVal, instr->intVal, index);
+				}
+			}
+		}
+	}
+	//
+	DEBUG("done.");
+	return true;
 }
 
 Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* thread, const char* sCondition) {
@@ -1835,14 +2330,21 @@ bool deleteWatch(Watch* watch) {
 DWORD __cdecl ScriptLibraryR_doStartScript(Script* pScript) {
 	//TRACE("ScriptLibraryR_doStartScript(%p)", pScript);
 	DWORD newTaskId = ScriptLibraryR.doStartScript(pScript);
-	tasksInfo[newTaskId] = new TaskInfo();
+	Task* task = getTaskById(newTaskId);
+	TaskInfo* info = new TaskInfo(newTaskId, pScript->name);
+	info->parameters.reserve(pScript->parameterCount);
+	for (int i = 0, j = pScript->parameterCount - 1; j >= 0; i++, j--) {
+		Parameter p = Parameter(pScript->localVars.pFirst[i]->name, task->stack.types[j]);
+		p.intVal = task->stack.intVals[j];
+		info->parameters.push_back(p);
+	}
+	tasksInfo[newTaskId] = info;
 	if (caller != NULL) {
 		tasksParents[newTaskId] = caller;
 		caller = NULL;
 	} else {
-		Task* thread = getTaskById(newTaskId);
-		threads[newTaskId] = thread;
-		debugger->threadStarted(thread);
+		threads[newTaskId] = task;
+		debugger->threadStarted(task);
 	}
 	return newTaskId;
 }
@@ -1852,25 +2354,32 @@ int __cdecl ScriptLibraryR_stopTask0(Task* pTask) {
 	for (auto it = watches.begin(); it != watches.end(); it++) {
 		Watch* watch = (*it).second;
 		if (watch->task == pTask) {
+			debugger->onMessage(1, "Watch removed: %s", watch->getExpression()->str.c_str());
 			it = watches.erase(it);
 			delete watch;
 			it--;
 		}
 	}
 	//
-	if (tasksParents.contains(pTask->taskNumber)) {
-		tasksParents.erase(pTask->taskNumber);
+	const int taskId = pTask->taskNumber;
+	char name[128];
+	strcpy(name, pTask->name);
+	auto taskInfo = tasksInfo[taskId];
+	tasksInfo.erase(taskId);
+	//
+	const int r = ScriptLibraryR.stopTask0(pTask);
+	//
+	if (tasksParents.contains(taskId)) {
+		tasksParents.erase(taskId);
 	} else {
-		threads.erase(pTask->taskNumber);
-		debugger->threadEnded(pTask);
-		if (pTask->taskNumber == allowedThreadId) {
+		threads.erase(taskId);
+		debugger->threadEnded(pTask, taskInfo);
+		if (taskId == allowedThreadId) {
 			allowedThreadId = 0;
 		}
 	}
-	auto taskInfo = tasksInfo[pTask->taskNumber];
-	tasksInfo.erase(pTask->taskNumber);
 	delete taskInfo;
-	return ScriptLibraryR.stopTask0(pTask);	//This frees the memory, so must be called after
+	return r;
 }
 
 DWORD __cdecl ScriptLibraryR_opcode_24_CALL(Task* pTask, Instruction* pInstr) {
@@ -1980,9 +2489,11 @@ void initScriptLibraryR() {
 		if (version == 8) {
 			//Internal functions
 			ScriptLibraryR.pLoadGameHeaders			= (FARPROC)(ScriptLibraryR.base + loadGameHeadersOffset);
+			ScriptLibraryR.pCreateArray				= (FARPROC)(ScriptLibraryR.base + createArrayOffset);
 			ScriptLibraryR.pGetVarType				= (FARPROC)(ScriptLibraryR.base + getVarTypeOffset);
 			ScriptLibraryR.pSetVarType				= (FARPROC)(ScriptLibraryR.base + setVarTypeOffset);
 			ScriptLibraryR.pCreateVar				= (FARPROC)(ScriptLibraryR.base + createVarOffset);
+			ScriptLibraryR.pAddStringToDataSection	= (FARPROC)(ScriptLibraryR.base + addStringToDataSectionOffset);
 			ScriptLibraryR.pDoStartScript			= (FARPROC)(ScriptLibraryR.base + doStartScriptOffset);
 			ScriptLibraryR.pStopTask0				= (FARPROC)(ScriptLibraryR.base + stopTask0Offset);
 			ScriptLibraryR.pTaskExists				= (FARPROC)(ScriptLibraryR.base + taskExistsOffset);
@@ -2006,6 +2517,7 @@ void initScriptLibraryR() {
 			ScriptLibraryR.ppCurrentTaskExceptStruct= (ExceptStruct**)	(ScriptLibraryR.base + pCurrentTaskExceptStructOffset);
 			ScriptLibraryR.pMainStack				= (Stack*)			(ScriptLibraryR.base + mainStackOffset);
 			ScriptLibraryR.pTaskList				= (TaskEntry**)		(ScriptLibraryR.base + pTaskListOffset);
+			ScriptLibraryR.pAutostartScriptsList	= (AutostartScriptsList*)(ScriptLibraryR.base + autostartScriptsListOffset);
 			ScriptLibraryR.pGlobalVarsDecl			= (VarTypeEntry**)	(ScriptLibraryR.base + globalVarsDeclOffset);
 			ScriptLibraryR.globalVars				= (VarVector*)		(ScriptLibraryR.base + pGlobalVarsOffset);
 			ScriptLibraryR.pScriptList				= (ScriptEntry**)	(ScriptLibraryR.base + pScriptListOffset);
@@ -2063,11 +2575,7 @@ void __fastcall GGame__StartGame_Detour(Game* _this, int edx) {
 }
 
 void __fastcall GGame__Loop_Detour(void* _this, int edx) {
-	TRACE("GGame::Loop - Starting...");
-	if (!started) {
-		started = true;
-		debugger->start();
-	}
+	INFO("GGame::Loop - Starting...");
 	GGame__Loop(_this);
 }
 
@@ -2086,7 +2594,7 @@ bool __fastcall GSetup__LoadMapScript_Detour(int edx) {
 }
 
 signed int __fastcall GGame__Init_Detour(void* _this, int edx) {
-	TRACE("GGame_Init");
+	INFO("GGame_Init");
 	int buffer = GGame__Init(_this);
 	int buffer2 = edx;
 	edx = buffer2;
@@ -2120,7 +2628,7 @@ void init_mods() {
 }
 
 void deinit_mods() {
-
+	debugger->term();
 }
 
 
@@ -2138,10 +2646,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			debugging = useGdb || useXDebug || strstr(cmd, " /debug") != NULL;
 			if (debugging) {
 				if (useXDebug) {
-					Fail("debugger: xdebug is not supported yet");
+					#ifdef DEBUGGER_XDEBUG
+
+					#else
+						ERR("xdebug is not supported");
+					#endif
 				} else {
-					debugger = new Gdb();	//Default
+					#ifdef DEBUGGER_GDB
+						debugger = new Gdb();
+					#else
+						ERR("gdb is not supported");
+					#endif
 				}
+				if (debugger == NULL) {
+					debugging = false;
+					ERR("debugger not set");
+				}
+			}
+			if (debugging) {
 				strcpy(buffer, cmd);
 				argc = splitArgs(buffer, ' ', argv, 32);
 				char* sources = getArgVal(argv, argc, "/debug:src");

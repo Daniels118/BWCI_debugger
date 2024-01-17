@@ -2,8 +2,11 @@
 
 #include <list>
 
-#include "logger.h"
-#define LOG_LEVEL LL_INFO
+#undef __FILENAME__
+#undef LOG_LEVEL
+#undef PAUSE_ON
+#define __FILENAME__ "dllmain.h"
+#define LOG_LEVEL 4
 #include "logger.h"
 
 constexpr auto INDEX_OUT_OF_BOUNDS = -2;

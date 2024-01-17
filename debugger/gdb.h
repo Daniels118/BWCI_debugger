@@ -1,11 +1,15 @@
 #pragma once
 
+#define DEBUGGER_GDB
+
 #include "ScriptLibraryR.h"
 #include "debug.h"
+#include "assembler.h"
 #include "utils.h"
 
 #include <iostream>
 #include <queue>
+#include <regex>
 
 class Display {
 	public:
@@ -39,6 +43,8 @@ class Gdb : public Debugger {
 		static char lastPrintedFile[256];
 		static int firstPrintedLine;
 		static int lastPrintedLine;
+		static Task* lastPrintedLineTask;
+		static int lastPrintedLineIp;
 
 		static Task* currentFrame;
 		static int compiledThreadId;
@@ -57,8 +63,19 @@ class Gdb : public Debugger {
 		static std::vector<int> blocks;
 		static int inScript;
 
+		static bool captureKilledThreads;
+		static std::list<TaskInfo> killedThreads;
+
+		static int shell_exitcode_id;
+
+		static HWND gameWindow;
+		static HHOOK keyHook;
+
 	public:
 		Gdb() {
+			#ifdef CHL_ASSEMBLER
+				assembler_init();
+			#endif
 			char* cmd = GetCommandLineA();
 			strcpy(buffer, cmd);
 			int argc = splitArgs(buffer, ' ', argv, MAX_ARGS);
@@ -78,12 +95,24 @@ class Gdb : public Debugger {
 			if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
 				printf("ERROR: cannot set control handler\n");
 			}
-		}
-
-		void start() {
+			gameWindow = findProcessWindowExcluding(NULL, GetConsoleWindow());
+			keyHook = SetWindowsHookExW(WH_KEYBOARD, keyHookHandler, NULL, GetCurrentThreadId());
+			if (keyHook == NULL) {
+				printf("Failed to install keyboard hook.");
+			}
 			printf("\n");
 			printf("Debugging using gdb interface.\n");
 			printf("Press CTRL+C to break the execution and get a prompt. For help, type \"help\".\n");
+		}
+
+		void term() {
+			if (keyHook != NULL) {
+				UnhookWindowsHookEx(keyHook);
+			}
+		}
+
+		void start() {
+			shell_exitcode_id = getOrDeclareGlobalVar("_shell_exitcode", 1);
 		}
 
 		void threadStarted(Task* thread) {
@@ -98,16 +127,27 @@ class Gdb : public Debugger {
 			printf("Thread %i \"%s\" resumed, currently in \"%s\" at %s:%i\n", thread->taskNumber, thread->name, frame->name, frame->filename, instr->linenumber);
 		}
 
-		void threadEnded(Task* thread) {
-			if (thread == catchThread) {
+		void threadEnded(void* pThread, TaskInfo* info) {
+			if (pThread == catchThread) {
 				catchThread = NULL;
 			}
 			if (!runningCompileCommand) {
-				printf("Thread %i \"%s\" ended\n", thread->taskNumber, thread->name);
-			}
-			if (thread->taskNumber == compiledThreadId) {
-				allowedThreadId = resumeThreadId;	//Resume from previous thread and
-				pause = true;						//  stop when previous thread resumes
+				printf("Thread %i \"%s\" ended\n", info->id, info->name.c_str());
+				if (captureKilledThreads) {
+					killedThreads.push_back(*info);
+				}
+			} else if (info->id == compiledThreadId) {
+				if (deleteScriptByName("_gdb_expr_")) {
+					unsetSource("__debugger_compile");
+				}
+				allowedThreadId = resumeThreadId;	//Resume from previous thread (if any)
+				if (resumeThreadId > 0) {			//if there was a previous thread
+					pause = true;					//  stop when previous thread resumes
+				} else {							//else prompt for new commands
+					compiledThreadId = 0;
+					runningCompileCommand = false;
+					readAndExecuteCommand(NULL);
+				}
 			}
 		}
 
@@ -150,17 +190,23 @@ class Gdb : public Debugger {
 		}
 
 		void onPauseBeforeInstruction(Task* task) {
-			if (!checkTempScriptEnded()) {
+			checkTempScriptEnded();
+			if (task != lastPrintedLineTask || task->ip != lastPrintedLineIp) {
 				printDisplays(task);
 				printCurrentInstruction(task);
+				lastPrintedLineTask = task;
+				lastPrintedLineIp = task->ip;
 			}
 			readAndExecuteCommand(task);
 		}
 
 		void onPauseBeforeLine(Task* task) {
-			if (!checkTempScriptEnded()) {
+			checkTempScriptEnded();
+			if (task != lastPrintedLineTask || task->ip != lastPrintedLineIp) {
 				printDisplays(task);
 				printCurrentLine(task);
+				lastPrintedLineTask = task;
+				lastPrintedLineIp = task->ip;
 			}
 			readAndExecuteCommand(task);
 		}
@@ -192,36 +238,47 @@ class Gdb : public Debugger {
 	private:
 		static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
 			switch (fdwCtrlType) {
-			case CTRL_C_EVENT:
-				if (!commandQueue.empty()) {
-					commandQueue.clear();
-					printf("\nScript execution interrupted.\n");
-				}
-				printf("\nPaused.\n");
-				if (*ScriptLibraryR.pTaskList != NULL && !gamePaused) {
-					pause = true;
-				} else {
-					readAndExecuteCommand(NULL);
-				}
-				return TRUE;
-			default:
-				return FALSE;
+				case CTRL_C_EVENT:
+					if (!commandQueue.empty()) {
+						commandQueue.clear();
+						printf("\nScript execution interrupted.\n");
+					}
+					printf("\nPaused.\n");
+					if (*ScriptLibraryR.pTaskList != NULL && !gamePaused) {
+						pause = true;
+					} else {
+						readAndExecuteCommand(NULL);
+					}
+					return TRUE;
+				default:
+					return FALSE;
 			}
 		}
 
-		static bool checkTempScriptEnded() {
+		static LRESULT CALLBACK keyHookHandler(int code, WPARAM wParam, LPARAM lParam) {
+			if (code >= 0) {
+				if (wParam == 0x43 && lParam & 0x80000000 && GetKeyState(VK_CONTROL) & 0x8000) {	//CTRL+C (on keyup)
+					printf("\nPaused.\n");
+					HWND hwnd = GetConsoleWindow();
+					SetForegroundWindow(hwnd);
+					SetActiveWindow(hwnd);
+					if (*ScriptLibraryR.pTaskList != NULL && !gamePaused) {
+						pause = true;
+					} else {
+						readAndExecuteCommand(NULL);
+					}
+				}
+			}
+			return CallNextHookEx(NULL, code, wParam, lParam);
+		}
+
+		static void checkTempScriptEnded() {
 			if (runningCompileCommand && !ScriptLibraryR.taskExists(compiledThreadId)) {
 				resumeThreadId = 0;
 				allowedThreadId = 0;
-				if (deleteScriptByName("_gdb_expr_")) {
-					unsetSource("__debugger_compile");
-					//printf("Script '_gdb_expr_' deleted.\n");
-				}
 				compiledThreadId = 0;
 				runningCompileCommand = false;
-				return true;
 			}
-			return false;
 		}
 
 		static void printDisplays(Task* task) {
@@ -351,13 +408,6 @@ class Gdb : public Debugger {
 					break;
 				}
 			}
-		}
-
-		static const char* ltrim(const char* str) {
-			while (*str != 0 && (*str == ' ' || *str == '\t')) {
-				str++;
-			}
-			return str;
 		}
 
 		static bool inArray(const int value, char** argv, int argc) {
@@ -503,6 +553,8 @@ class Gdb : public Debugger {
 				return c_backtrace(rawBuffer, argc, cmd);
 			} else if (abbrev(cmd, "break", 1) || streq(cmd, "tbreak")) {
 				return c_break(rawBuffer, argc, cmd);
+			} else if (streq(cmd, "call")) {
+				return c_call(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "catch")) {
 				return c_catch(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "clear")) {
@@ -550,6 +602,8 @@ class Gdb : public Debugger {
 				return c_finish(rawBuffer, argc, cmd);
 			} else if (abbrev(cmd, "frame", 1)) {
 				return c_frame(rawBuffer, argc, cmd);
+			} else if (streq(cmd, "help")) {
+				return c_help(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "if") && inScript > 0) {
 				return c_if(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "ignore")) {
@@ -566,6 +620,8 @@ class Gdb : public Debugger {
 				return c_loop_break(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "loop_continue") && inScript > 0) {
 				return c_loop_continue(rawBuffer, argc, cmd);
+			} else if (streq(cmd, "make")) {
+				return c_make(rawBuffer, argc, cmd);
 			} else if (abbrev(cmd, "next", 1)) {
 				return c_next(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "ni") || streq(cmd, "nexti")) {
@@ -586,6 +642,8 @@ class Gdb : public Debugger {
 				return c_frame(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "set")) {
 				return c_set(rawBuffer, argc, cmd);
+			} else if (streq(cmd, "shell")) {
+				return c_shell(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "show")) {
 				return c_show(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "source")) {
@@ -604,6 +662,8 @@ class Gdb : public Debugger {
 				return c_until(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "up")) {
 				return c_up(rawBuffer, argc, cmd);
+			} else if (streq(cmd, "updatechl")) {	//Custom command
+				return c_updateChl(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "watch")) {
 				return c_watch(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "whatis")) {
@@ -612,8 +672,8 @@ class Gdb : public Debugger {
 				return c_while(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "x")) {
 				return c_x(rawBuffer, argc, cmd);
-			} else if (streq(cmd, "help")) {
-				return c_help(rawBuffer, argc, cmd);
+			} else if (cmd[0] == '!') {
+				return c_shell(rawBuffer, argc, cmd);
 			} else if (userCommands.contains(cmd)) {
 				return c_userCommand(rawBuffer, argc, cmd);
 			}
@@ -803,6 +863,55 @@ class Gdb : public Debugger {
 			return false;
 		}
 
+		static bool c_call(char* rawBuffer, int argc, const char* cmd) {
+			if (argc >= 2) {
+				char* scriptName = argv[1];
+				Script* script = getScriptByName(scriptName);
+				if (script == NULL) {
+					printf("Script %s not found\n", scriptName);
+					return false;
+				}
+				if (argc >= 3) {
+					char* sArgs = rawBuffer + (argv[2] - buffer);
+					argc = splitArgs(sArgs, ',', argv, MAX_ARGS);
+				} else {
+					argc = 0;
+				}
+				if (argc != script->parameterCount) {
+					printf("Script %s expects %i parameters\n", scriptName, script->parameterCount);
+					return false;
+				}
+				//Evaluate parameters
+				FLOAT params[MAX_ARGS];
+				for (int i = 0; i < argc; i++) {
+					int datatype = DT_FLOAT;
+					Var* param = evalString(currentFrame, argv[i], datatype);
+					if (param == NULL) {
+						printf("Failed to evaluate parameter %i.\n", i);
+						return false;
+					}
+					params[i] = param->floatVal;
+				}
+				//Push parameters on the stack
+				for (int i = 0; i < argc; i++) {
+					ScriptLibraryR.PUSH(params[i], 2);
+				}
+				//Start the script
+				int taskNumber = ScriptLibraryR.StartScript(NULL, scriptName, 0xFFFFFFFF);
+				if (taskNumber != 0) {
+					breakAfterLines = 1;
+					steppingThread = getTaskById(taskNumber);
+					return true;
+				} else {
+					printf("Failed to start script %s\n", scriptName);
+					return false;
+				}
+			} else {
+				printf("Missing argument.\n");
+				return false;
+			}
+		}
+
 		static bool c_catch(char* rawBuffer, int argc, const char* cmd) {
 			if (argc < 2) {
 				catchThread = NULL;
@@ -940,9 +1049,9 @@ class Gdb : public Debugger {
 						return false;
 					}
 					std::string cmd = "p " + std::string(expr);
-					strcpy(buffer, cmd.c_str());
-					processCommand();
-					return false;
+					//strcpy(buffer, cmd.c_str());
+					//processCommand();
+					commandQueue.push_front(cmd);
 				} else {
 					std::vector<std::string> lines;
 					if (!raw) {
@@ -987,21 +1096,18 @@ class Gdb : public Debugger {
 							printf("Cannot find script '_gdb_expr_'.\n");
 						} else {
 							setSource("__debugger_compile", lines);
-							if (currentFrame != NULL) {
-								resumeThreadId = getThread(currentFrame)->taskNumber;
-							}
+							resumeThreadId = currentFrame != NULL ? getThread(currentFrame)->taskNumber : 0;
 							runningCompileCommand = true;
 							compiledThreadId = ScriptLibraryR.StartScript(0, "_gdb_expr_", -1);
 							allowedThreadId = compiledThreadId;
 							return true;
 						}
 					}
-					return false;
 				}
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_cond(char* rawBuffer, int argc, const char* cmd) {
@@ -1022,11 +1128,10 @@ class Gdb : public Debugger {
 				} else {
 					printf("Breakpoint not found\n");
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_continue(char* rawBuffer, int argc, const char* cmd) {
@@ -1061,11 +1166,10 @@ class Gdb : public Debugger {
 					ucmd.commands.push_back(buffer);
 				}
 				ucmd.commands.push_back("end_of_script");
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_delete(char* rawBuffer, int argc, const char* cmd) {
@@ -1076,7 +1180,6 @@ class Gdb : public Debugger {
 						unsetBreakpoint(breakpoint);
 					}
 				}
-				return false;
 			} else if (argc == 3 && abbrev(argv[1], "display", 4)) {
 				int index = atoi(argv[1]) - 1;
 				if (index < 0 || index >= (int)displays.size()) {
@@ -1088,7 +1191,6 @@ class Gdb : public Debugger {
 					displays.erase(it);
 					delete display;
 				}
-				return false;
 			} else {
 				int index = atoi(argv[1]) - 1;
 				if (index < 0) {
@@ -1123,8 +1225,8 @@ class Gdb : public Debugger {
 						}
 					}
 				}
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_directory(char* rawBuffer, int argc, const char* cmd) {
@@ -1134,13 +1236,12 @@ class Gdb : public Debugger {
 				for (int i = 1; i < argc; i++) {
 					sourcePath.insert(argv[i]);
 				}
-				return false;
 			} else {
 				//dir
 				//  clear source path
 				sourcePath.clear();
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_disassemble(char* rawBuffer, int argc, const char* cmd) {
@@ -1148,6 +1249,10 @@ class Gdb : public Debugger {
 			int ip = -1;
 			int startIp = -1;
 			int endIp = -1;
+			Script unknownScript;
+			unknownScript.name = (char*)"0";
+			unknownScript.filename = (char*)"";
+			unknownScript.instructionAddress = 0;
 			Script* script = NULL;
 			bool withSource = getArgFlag(argv, argc, "/m") || getArgFlag(argv, argc, "/s");
 			bool printFuncName = false;
@@ -1156,9 +1261,16 @@ class Gdb : public Debugger {
 				if (argv[i][0] != '/') {
 					char* arg = argv[i];
 					arg = rawBuffer + (arg - buffer);
-					//rejoinArgs(argv, argc, arg, NULL);
 					argc = splitArgs(arg, ',', argv, 2);
-					ip = atoi(argv[0]);
+					if (streq(argv[0], "$ip")) {
+						if (currentFrame == NULL) {
+							printf("No active frame.\n");
+							return false;
+						}
+						ip = currentFrame->ip;
+					} else {
+						ip = atoi(argv[0]);
+					}
 					if (ip < 0 || ip >= count) {
 						printf("Invalid instruction address.\n");
 						return false;
@@ -1169,11 +1281,15 @@ class Gdb : public Debugger {
 						if (argv[1][0] == '+') {
 							endIp += startIp;
 						}
-						if (endIp <= startIp || endIp > count) {
+						if (endIp <= startIp) {
 							printf("Invalid end instruction address.\n");
 							return false;
 						}
+						if (endIp > count) {
+							endIp = count;
+						}
 						script = findScriptByIp(startIp);
+						if (script == NULL) script = &unknownScript;
 						printFuncName = true;
 						funcName = script->name;
 					}
@@ -1189,8 +1305,9 @@ class Gdb : public Debugger {
 					ip = currentFrame->ip;
 				}
 				script = findScriptByIp(ip);
-				startIp = script->instructionAddress;
+				startIp = script != NULL ? script->instructionAddress : ip;
 				endIp = findInstruction(ip, END) + 1;
+				if (script == NULL) script = &unknownScript;
 			}
 			printf("Dump of assembler code from %i to %i:\n", startIp, endIp);
 			int lastDisplayedLine = 0;
@@ -1198,20 +1315,17 @@ class Gdb : public Debugger {
 			for (int ip = startIp; ip < endIp; ip++) {
 				if (script == NULL) {
 					script = findScriptByIp(ip);
-					funcName = script != NULL ? script->name : "unknown";
+					if (script == NULL) script = &unknownScript;
+					funcName = script->name;
 				}
 				Instruction* instr = getInstruction(ip);
-				if (withSource && instr->linenumber != lastDisplayedLine) {
+				if (withSource && script != &unknownScript && instr->linenumber != lastDisplayedLine) {
 					std::string line = getSourceLine(script->filename, instr->linenumber);
 					printf("%i\t%s\n", instr->linenumber, line.c_str());
 					lastDisplayedLine = instr->linenumber;
 				}
 				formatInstruction(script, instr, buffer);
-				if (script != NULL) {
-					printf("%0*i <%s+%i>:\t%s\n", width, ip, funcName, ip - script->instructionAddress, buffer);
-				} else {
-					printf("%0*i <%i>:\t%s\n", width, ip, ip, buffer);
-				}
+				printf("%0*i <%s+%i>:\t%s\n", width, ip, funcName, ip - script->instructionAddress, buffer);
 				if (instr->opcode == END) {
 					script = NULL;
 					printf("\n");
@@ -1226,7 +1340,6 @@ class Gdb : public Debugger {
 				for (Breakpoint* breakpoint : getBreakpoints()) {
 					breakpoint->setEnabled(false);
 				}
-				return false;
 			} else if (argc == 3 && abbrev(argv[1], "display", 4)) {
 				int index = atoi(argv[2]) - 1;
 				if (index < 0 || index >= (int)displays.size()) {
@@ -1237,7 +1350,6 @@ class Gdb : public Debugger {
 					Display* display = *it;
 					display->enabled = false;
 				}
-				return false;
 			} else {
 				int index = atoi(argv[argc - 1]) - 1;
 				if (index < 0) {
@@ -1273,8 +1385,8 @@ class Gdb : public Debugger {
 						}
 					}
 				}
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_display(char* rawBuffer, int argc, const char* cmd) {
@@ -1349,7 +1461,6 @@ class Gdb : public Debugger {
 				for (Breakpoint* breakpoint : getBreakpoints()) {
 					breakpoint->setEnabled(true);
 				}
-				return false;
 			} else if (argc == 3 && abbrev(argv[1], "display", 4)) {
 				int index = atoi(argv[2]) - 1;
 				if (index < 0 || index >= (int)displays.size()) {
@@ -1360,7 +1471,6 @@ class Gdb : public Debugger {
 					Display* display = *it;
 					display->enabled = true;
 				}
-				return false;
 			} else {
 				bool once = getArgFlag(argv, argc, "once");
 				bool deleteOnHit = getArgFlag(argv, argc, "del");
@@ -1404,8 +1514,8 @@ class Gdb : public Debugger {
 						}
 					}
 				}
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_end(char* rawBuffer, int argc, const char* cmd) {
@@ -1432,11 +1542,10 @@ class Gdb : public Debugger {
 				if (len > 0) {
 					commandQueue.push_front(line);
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_finish(char* rawBuffer, int argc, const char* cmd) {
@@ -1512,11 +1621,10 @@ class Gdb : public Debugger {
 					lines.push_back("end");
 					commandQueue.insert(commandQueue.begin(), lines.begin(), lines.end());
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_ignore(char* rawBuffer, int argc, const char* cmd) {
@@ -1530,11 +1638,10 @@ class Gdb : public Debugger {
 				} else {
 					printf("Breakpoint not found\n");
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_info(char* rawBuffer, int argc, const char* cmd) {
@@ -1548,6 +1655,8 @@ class Gdb : public Debugger {
 					return c_info_breakpoints(rawBuffer, argc, cmd);
 				} else if (streq(arg, "display")) {
 					return c_info_display(rawBuffer, argc, cmd);
+				} else if (streq(arg, "func")) {
+					return c_info_func(rawBuffer, argc, cmd);
 				} else if (streq(arg, "locals")) {
 					return c_info_locals(rawBuffer, argc, cmd);
 				} else if (abbrev(arg, "reg", 1)) {
@@ -1558,6 +1667,10 @@ class Gdb : public Debugger {
 					return c_info_sources(rawBuffer, argc, cmd);
 				} else if (streq(arg, "threads")) {
 					return c_info_threads(rawBuffer, argc, cmd);
+				} else if (streq(arg, "var")) {
+					return c_info_var(rawBuffer, argc, cmd);
+				} else {
+					printf("Invalid argument.\n");
 				}
 			} else {
 				printf("Missing argument.\n");
@@ -1583,11 +1696,10 @@ class Gdb : public Debugger {
 				} else {
 					printf("Symbol not found\n");
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_info_args(char* rawBuffer, int argc, const char* cmd) {
@@ -1644,6 +1756,34 @@ class Gdb : public Debugger {
 			return false;
 		}
 
+		static bool c_info_func(char* rawBuffer, int argc, const char* cmd) {
+			std::regex pattern;
+			if (argc >= 3) {
+				try {
+					pattern = std::regex(argv[2], std::regex::icase);
+				} catch (std::regex_error& e) {
+					printf("Invalid regex: %s.\n", e.what());
+					return false;
+				}
+			} else {
+				pattern = std::regex(".*", std::regex::icase);
+			}
+			for (Script* script : getScripts()) {
+				if (std::regex_search(script->name, pattern)) {
+					std::string params = "";
+					if (script->parameterCount > 0) {
+						params = script->localVars.pFirst[0]->name;
+						for (DWORD i = 1; i < script->parameterCount; i++) {
+							params += ", " + std::string(script->localVars.pFirst[i]->name);
+						}
+					}
+					printf("%i: %s(%s) at %i from '%s'\n", script->id, script->name, params.c_str(),
+							script->instructionAddress, script->filename);
+				}
+			}
+			return false;
+		}
+
 		static bool c_info_locals(char* rawBuffer, int argc, const char* cmd) {
 			//info locals
 			if (currentFrame == NULL) {
@@ -1677,6 +1817,7 @@ class Gdb : public Debugger {
 			}
 			#define PR_REG(REG, EXPR) if (argc <= 2 || inArray(REG, argv+2, argc-2)) printf("%-3s %9i\n", REG, EXPR);
 			PR_REG("ip", currentFrame->ip);
+			PR_REG("ba", currentFrame->instructionAddress);
 			PR_REG("sc", currentFrame->stack.count);
 			PR_REG("gc", currentFrame->globalsCount);
 			PR_REG("lc", getLocalVarsCount(currentFrame));
@@ -1707,10 +1848,14 @@ class Gdb : public Debugger {
 		static bool c_info_sources(char* rawBuffer, int argc, const char* cmd) {
 			//info sources
 			//  list all source files in use
+			std::unordered_set<std::string> printed;
 			ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList;
 			while (scriptEntry != NULL) {
 				Script* script = scriptEntry->script;
-				printf("%s\n", script->filename);
+				if (!printed.contains(script->filename)) {
+					printf("%s\n", script->filename);
+					printed.insert(script->filename);
+				}
 				scriptEntry = scriptEntry->next;
 			}
 			return false;
@@ -1736,6 +1881,30 @@ class Gdb : public Debugger {
 					sprintf(targetId, "Thread %i \"%s\"", thread->taskNumber, thread->name);
 					sprintf(sFrame, "%s (%s) at %s:%i", tFrame->name, args, tFrame->filename, instruction->linenumber);
 					printf("%-2s%-5i%-50s%s\n", current, id, targetId, sFrame);
+				}
+			}
+			return false;
+		}
+
+		static bool c_info_var(char* rawBuffer, int argc, const char* cmd) {
+			std::regex pattern;
+			if (argc >= 3) {
+				try {
+					pattern = std::regex(argv[2], std::regex::icase);
+				} catch (std::regex_error& e) {
+					printf("Invalid regex: %s.\n", e.what());
+					return false;
+				}
+			} else {
+				pattern = std::regex(".*", std::regex::icase);
+			}
+			for (VarDef var : getGlobalVarDefs()) {
+				if (std::regex_search(var.name, pattern)) {
+					if (var.size == 1) {
+						printf("%i: %s\n", var.id, var.name.c_str());
+					} else {
+						printf("%i: %s[%i]\n", var.id, var.name.c_str(), var.size);
+					}
 				}
 			}
 			return false;
@@ -1782,11 +1951,10 @@ class Gdb : public Debugger {
 						printCurrentLine(currentFrame);
 					}
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_kill(char* rawBuffer, int argc, const char* cmd) {
@@ -1942,6 +2110,14 @@ class Gdb : public Debugger {
 			return false;
 		}
 
+		static bool c_make(char* rawBuffer, int argc, const char* cmd) {
+			Var* var = getGlobalVarById(shell_exitcode_id);
+			const char* arg = ltrim(rawBuffer);
+			int r = system(arg);
+			if (var != NULL) var->floatVal = (float)r;
+			return false;
+		}
+
 		static bool c_next(char* rawBuffer, int argc, const char* cmd) {
 			if (currentFrame != NULL) {
 				breakFromAddress = 0x7FFFFFFF;
@@ -1971,21 +2147,19 @@ class Gdb : public Debugger {
 		static bool c_output(char* rawBuffer, int argc, const char* cmd) {
 			if (argc >= 2) {
 				uprint(rawBuffer, "", "");
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_print(char* rawBuffer, int argc, const char* cmd) {
 			if (argc >= 2) {
 				uprint(rawBuffer, "$1 = ", "\n");
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_printf(char* rawBuffer, int argc, const char* cmd) {
@@ -1998,11 +2172,10 @@ class Gdb : public Debugger {
 				if (len >= 0) {
 					printf("%s", line);
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_quit(char* rawBuffer, int argc, const char* cmd) {
@@ -2026,6 +2199,8 @@ class Gdb : public Debugger {
 				if (ip < 0) {
 					printf("Cannot find end of script\n");
 				} else {
+					//TODO: the execution should stop in the caller task
+
 					currentFrame->ip = ip;
 					printCurrentInstruction(currentFrame);
 				}
@@ -2034,55 +2209,8 @@ class Gdb : public Debugger {
 		}
 
 		static bool c_run(char* rawBuffer, int argc, const char* cmd) {
-			if (argc == 1) {
-				printf("Continuing.\n");
-				return true;
-			} else if (argc >= 2) {
-				char* scriptName = argv[1];
-				Script* script = getScriptByName(scriptName);
-				if (script == NULL) {
-					printf("Script %s not found\n", scriptName);
-					return false;
-				}
-				if (argc >= 3) {
-					char* sArgs = rawBuffer + (argv[2] - buffer);
-					argc = splitArgs(sArgs, ',', argv, MAX_ARGS);
-				} else {
-					argc = 0;
-				}
-				if (argc != script->parameterCount) {
-					printf("Script %s expects %i parameters\n", scriptName, script->parameterCount);
-					return false;
-				}
-				//Evaluate parameters
-				FLOAT params[MAX_ARGS];
-				for (int i = 0; i < argc; i++) {
-					int datatype = DT_FLOAT;
-					Var* param = evalString(currentFrame, argv[i], datatype);
-					if (param == NULL) {
-						printf("Failed to evaluate parameter %i.\n", i);
-						return false;
-					}
-					params[i] = param->floatVal;
-				}
-				//Push parameters on the stack
-				for (int i = 0; i < argc; i++) {
-					ScriptLibraryR.PUSH(params[i], 2);
-				}
-				//Start the script
-				int taskNumber = ScriptLibraryR.StartScript(NULL, scriptName, 0xFFFFFFFF);
-				if (taskNumber != 0) {
-					breakAfterLines = 1;
-					steppingThread = getTaskById(taskNumber);
-					return true;
-				} else {
-					printf("Failed to start script %s\n", scriptName);
-					return false;
-				}
-			} else {
-				printf("Missing argument.\n");
-				return false;
-			}
+			printf("Continuing.\n");
+			return true;
 		}
 
 		static bool c_set(char* rawBuffer, int argc, const char* cmd) {
@@ -2109,140 +2237,258 @@ class Gdb : public Debugger {
 						printf("Invalid property.\n");
 					}
 					return false;
-				} else if (streq(type, "console") && argc == 4) {
-					char* prop = argv[2];
-					char* sVal = argv[3];
-					if (streq(prop, "position")) {
-						HWND hwnd = GetConsoleWindow();
-						if (streq(sVal, "tl")) {
-							alignWindow(hwnd, NULL, Anchor::TOP_LEFT);
-						} else if (streq(sVal, "tr")) {
-							alignWindow(hwnd, NULL, Anchor::TOP_RIGHT);
-						} else if (streq(sVal, "br")) {
-							alignWindow(hwnd, NULL, Anchor::BOTTOM_RIGHT);
-						} else if (streq(sVal, "bl")) {
-							alignWindow(hwnd, NULL, Anchor::BOTTOM_LEFT);
-						} else {
-							argc = splitArgs(sVal, ',', argv, 2);
-							if (argc == 2) {
-								int x = atoi(argv[0]);
-								int y = atoi(argv[1]);
-								SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-							} else {
-								printf("Invalid coordinates.\n");
-							}
-						}
-					} else if (streq(prop, "size")) {
-						HWND hwnd = GetConsoleWindow();
-						argc = splitArgs(sVal, ',', argv, 2);
-						if (argc == 2) {
-							int w = atoi(argv[0]);
-							int h = atoi(argv[1]);
-							if (w < 200) w = 200;
-							if (h < 100) h = 100;
-							SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
-						} else {
-							printf("Invalid size.\n");
-						}
-					} else {
-						printf("Invalid property.\n");
-					}
-					return false;
-				} else if (streq(type, "window") && argc == 4) {
-					char* prop = argv[2];
-					char* sVal = argv[3];
-					if (streq(prop, "position")) {
-						HWND hwnd = findMainWindow(NULL);
-						if (streq(sVal, "tl")) {
-							alignWindow(hwnd, NULL, Anchor::TOP_LEFT);
-						} else if (streq(sVal, "tr")) {
-							alignWindow(hwnd, NULL, Anchor::TOP_RIGHT);
-						} else if (streq(sVal, "br")) {
-							alignWindow(hwnd, NULL, Anchor::BOTTOM_RIGHT);
-						} else if (streq(sVal, "bl")) {
-							alignWindow(hwnd, NULL, Anchor::BOTTOM_LEFT);
-						} else {
-							argc = splitArgs(sVal, ',', argv, 2);
-							if (argc == 2) {
-								int x = atoi(argv[0]);
-								int y = atoi(argv[1]);
-								SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-							} else {
-								printf("Invalid coordinates.\n");
-							}
-						}
-					} else {
-						printf("Invalid property.\n");
-					}
-					return false;
+				} else if (streq(type, "console")) {
+					return c_set_console(rawBuffer, argc, cmd);
+				} else if (streq(type, "window")) {
+					return c_set_window(rawBuffer, argc, cmd);
+				} else if (abbrev(type, "instruction", 5)) {
+					return c_set_instruction(rawBuffer, argc, cmd);
 				} else {
-					char* sExpr = argv[1];
-					if (streq(type, "var") || streq(type, "variable")) {
-						if (argc < 3) {
-							printf("Expected expression\n.");
-							return false;
-						}
-						sExpr = argv[2];
-					}
-					sExpr = rawBuffer + (sExpr - buffer);
-					//rejoinArgs(argv, argc, sExpr, NULL);
-					if (strchr(sExpr, '=') != NULL) {
-						splitArgs(sExpr, '=', argv, 2);
-						char* name = argv[0];
-						char* sValue = argv[1];
-						if (streq(name, "$ip")) {
-							currentFrame->ip = atoi(sValue);
-							printCurrentInstruction(currentFrame);
-						} else if (streq(name, "$sc")) {
-							currentFrame->stack.count = atoi(sValue);
-						} else if (streq(name, "$tks")) {
-							currentFrame->ticks = atoi(sValue);
-						} else {
-							Var* var;
-							if (strncmp(name, "{int}", 5) == 0) {
-								int varId = atoi(name + 5);
-								var = getVarById(currentFrame, varId);
-								if (var == NULL) {
-									printf("Invalid variable ID.\n");
-									return false;
-								}
-							} else {
-								var = getVar(currentFrame, name);
-								if (var == NULL && name[0] == '_') {
-									int gVarId = declareGlobalVar(name);
-									printf("Global variable '%s' defined with ID %i\n", name, gVarId);
-								}
-							}
-							if (var != NULL) {
-								if (streq(sValue, "true")) {
-									var->floatVal = 1.0;
-								} else if (streq(sValue, "false")) {
-									var->floatVal = 0.0;
-								} else {
-									int datatype = DT_FLOAT;
-									Var* res = evalString(currentFrame, sValue, datatype);
-									if (res != NULL) {
-										var->floatVal = res->floatVal;
-									}
-								}
-							} else {
-								Script* script = getTaskScript(currentFrame);
-								std::string code = "\t" + std::string(name) + " = " + std::string(sValue) + "\n0";
-								Expression* expr = getCompiledExpression(script, code, DT_FLOAT);
-								if (expr != NULL) {
-									evalExpression(currentFrame, expr);
-								}
-							}
-						}
-					} else {
-						printf("Expected =\n");
-					}
+					return c_set_variable(rawBuffer, argc, cmd);
 				}
-				return false;
 			} else {
+				printf("Missing argument.\n");
+			}
+			return false;
+		}
+
+		static bool c_set_console(char* rawBuffer, int argc, const char* cmd) {
+			if (argc < 3) {
 				printf("Missing argument.\n");
 				return false;
 			}
+			const HWND hwnd = GetConsoleWindow();
+			char* prop = argv[2];
+			if (abbrev(prop, "position", 3)) {
+				if (argc < 4) {
+					printf("Missing argument.\n");
+					return false;
+				}
+				char* sVal = argv[3];
+				setWindowPos(hwnd, sVal);
+			} else if (streq(prop, "size")) {
+				if (argc < 4) {
+					printf("Missing argument.\n");
+					return false;
+				}
+				char* sVal = argv[3];
+				argc = splitArgs(sVal, ',', argv, 2);
+				if (argc == 2) {
+					int w = atoi(argv[0]);
+					int h = atoi(argv[1]);
+					if (w < 200) w = 200;
+					if (h < 100) h = 100;
+					SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+				} else {
+					printf("Invalid size.\n");
+				}
+			} else if (streq(prop, "topmost")) {
+				SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+			} else if (streq(prop, "notopmost")) {
+				SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+			} else if (streq(prop, "maximize")) {
+				ShowWindow(hwnd, SW_MAXIMIZE);
+			} else if (streq(prop, "minimize")) {
+				ShowWindow(hwnd, SW_MINIMIZE);
+			} else if (streq(prop, "restore")) {
+				ShowWindow(hwnd, SW_RESTORE);
+			} else {
+				printf("Invalid property.\n");
+			}
+			return false;
+		}
+
+		static bool c_set_window(char* rawBuffer, int argc, const char* cmd) {
+			if (argc < 3) {
+				printf("Missing argument.\n");
+				return false;
+			}
+			char* prop = argv[2];
+			if (abbrev(prop, "position", 3)) {
+				if (argc < 4) {
+					printf("Missing argument.\n");
+					return false;
+				}
+				char* sVal = argv[3];
+				setWindowPos(gameWindow, sVal);
+			} else if (streq(prop, "topmost")) {
+				SetWindowPos(gameWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+			} else if (streq(prop, "notopmost")) {
+				SetWindowPos(gameWindow, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+			} else if (streq(prop, "minimize")) {
+				ShowWindow(gameWindow, SW_MINIMIZE);
+			} else if (streq(prop, "restore")) {
+				ShowWindow(gameWindow, SW_RESTORE);
+			} else {
+				printf("Invalid property.\n");
+			}
+			return false;
+		}
+
+		static void setWindowPos(const HWND hwnd, char* sVal) {
+			if (streq(sVal, "tl")) {
+				alignWindow(hwnd, NULL, Anchor::TOP_LEFT);
+			} else if (streq(sVal, "tr")) {
+				alignWindow(hwnd, NULL, Anchor::TOP_RIGHT);
+			} else if (streq(sVal, "br")) {
+				alignWindow(hwnd, NULL, Anchor::BOTTOM_RIGHT);
+			} else if (streq(sVal, "bl")) {
+				alignWindow(hwnd, NULL, Anchor::BOTTOM_LEFT);
+			} else {
+				int argc = splitArgs(sVal, ',', argv, 2);
+				if (argc == 2) {
+					int x = atoi(argv[0]);
+					int y = atoi(argv[1]);
+					SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+				} else {
+					printf("Invalid coordinates.\n");
+				}
+			}
+		}
+
+		static bool c_set_instruction(char* rawBuffer, int argc, const char* cmd) {
+			#ifdef CHL_ASSEMBLER
+				if (argc < 3) {
+					printf("Expected expression\n.");
+					return false;
+				}
+				char* sExpr = argv[2];
+				sExpr = rawBuffer + (sExpr - buffer);
+				if (strchr(sExpr, '=') != NULL) {
+					splitArgs(sExpr, '=', argv, 2);
+					char* sAddr = argv[0];
+					char* sValue = argv[1];
+					int base = 0;
+					char* sOffset = strchr(sAddr, '+');
+					if (sOffset == NULL) sOffset = sAddr;
+					if (sOffset > sAddr) {
+						*(sOffset++) = 0;	//Split base from offset
+						if (streq(sAddr, "$ip")) {
+							if (currentFrame == NULL) {
+								printf("No active frame.\n");
+								return false;
+							}
+							base = currentFrame->ip;
+						} else if (streq(sAddr, "$ba")) {
+							if (currentFrame == NULL) {
+								printf("No active frame.\n");
+								return false;
+							}
+							base = currentFrame->instructionAddress;
+						} else {
+							Script* script = getScriptByName(sAddr);
+							if (script == NULL) {
+								printf("Script '%s' not found.\n", sAddr);
+								return false;
+							}
+							base = script->instructionAddress;
+						}
+					}
+					if (!isNumber(sOffset)) {
+						printf("Invalid offset.\n");
+						return false;
+					}
+					int addr = base + atoi(sOffset);
+					if (addr < 0 || addr >= getTotalInstructions()) {
+						printf("Invalid address.\n");
+						return false;
+					}
+					Script* script = findScriptByIp(addr);
+					if (script == NULL) {
+						printf("Cannot determine script at instruction %i.\n", addr);
+						return false;
+					}
+					const char* msg = assemble(script, addr, sValue);
+					if (msg != NULL) {
+						printf("Assembler error: %s\n", msg);
+					}
+				} else {
+					printf("Expected =\n");
+				}
+			#else
+				printf("gdb has been compiled without assembler\n.");
+			#endif
+			return false;
+		}
+
+		static bool c_set_variable(char* rawBuffer, int argc, const char* cmd) {
+			char* sExpr = argv[1];
+			if (streq(sExpr, "var") || streq(sExpr, "variable")) {
+				if (argc < 3) {
+					printf("Expected expression\n.");
+					return false;
+				}
+				sExpr = argv[2];
+			}
+			sExpr = rawBuffer + (sExpr - buffer);
+			if (strchr(sExpr, '=') != NULL) {
+				splitArgs(sExpr, '=', argv, 2);
+				char* name = argv[0];
+				char* sValue = argv[1];
+				if (streq(name, "$ip")) {
+					currentFrame->ip = atoi(sValue);
+					printCurrentInstruction(currentFrame);
+				} else if (streq(name, "$sc")) {
+					currentFrame->stack.count = atoi(sValue);
+				} else if (streq(name, "$tks")) {
+					currentFrame->ticks = atoi(sValue);
+				} else {
+					Var* var;
+					if (strncmp(name, "{int}", 5) == 0) {
+						int varId = atoi(name + 5);
+						var = getVarById(currentFrame, varId);
+						if (var == NULL) {
+							printf("Invalid variable ID.\n");
+							return false;
+						}
+					} else {
+						var = getVar(currentFrame, name);
+						if (var == NULL && name[0] == '_') {
+							int gVarId = declareGlobalVar(name, 1);
+							printf("Global variable '%s' defined with ID %i\n", name, gVarId);
+						}
+					}
+					if (var != NULL) {
+						if (streq(sValue, "true")) {
+							var->floatVal = 1.0;
+						} else if (streq(sValue, "false")) {
+							var->floatVal = 0.0;
+						} else {
+							int datatype = DT_FLOAT;
+							Var* res = evalString(currentFrame, sValue, datatype);
+							if (res != NULL) {
+								var->floatVal = res->floatVal;
+							}
+						}
+					} else {
+						Script* script = getTaskScript(currentFrame);
+						std::string code = "\t" + std::string(name) + " = " + std::string(sValue) + "\n0";
+						Expression* expr = getCompiledExpression(script, code, DT_FLOAT);
+						if (expr != NULL) {
+							evalExpression(currentFrame, expr);
+						}
+					}
+				}
+			} else {
+				printf("Expected =\n");
+			}
+			return false;
+		}
+
+		static bool c_shell(char* rawBuffer, int argc, const char* cmd) {
+			Var* var = getGlobalVarById(shell_exitcode_id);
+			if (cmd[0] == '!') {
+				const char* arg = rawBuffer + (cmd + 1 - buffer);
+				int r = system(arg);
+				if (var != NULL) var->floatVal = (float)r;
+			} else if (argc >= 2) {
+				const char* arg = rawBuffer + (argv[1] - buffer);
+				int r = system(arg);
+				if (var != NULL) var->floatVal = (float)r;
+			} else {
+				printf("Missing argument.\n");
+			}
+			return false;
 		}
 
 		static bool c_show(char* rawBuffer, int argc, const char* cmd) {
@@ -2258,15 +2504,19 @@ class Gdb : public Debugger {
 							printf("%s\n", dir.c_str());
 						}
 					}
-					return false;
+				} else if (streq(arg, "console")) {
+					const HWND hwnd = GetConsoleWindow();
+					ShowWindow(hwnd, SW_SHOW);
+				} else if (streq(arg, "window")) {
+					const HWND hwnd = findProcessWindowExcluding(NULL, GetConsoleWindow());
+					ShowWindow(hwnd, SW_SHOW);
 				} else {
 					printf("Invalid argument.\n");
-					return false;
 				}
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_source(char* rawBuffer, int argc, const char* cmd) {
@@ -2292,11 +2542,10 @@ class Gdb : public Debugger {
 						inScript++;
 					}
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_step(char* rawBuffer, int argc, const char* cmd) {
@@ -2364,11 +2613,10 @@ class Gdb : public Debugger {
 					displays.erase(it);
 					delete display;
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_until(char* rawBuffer, int argc, const char* cmd) {
@@ -2434,34 +2682,82 @@ class Gdb : public Debugger {
 			return false;
 		}
 
+		static bool c_updateChl(char* rawBuffer, int argc, const char* cmd) {
+			const char* filename = argc >= 2 ? argv[1] : NULL;
+			captureKilledThreads = true;
+			if (updateCHL(filename)) {
+				if (!killedThreads.empty()) {
+					int r = 0;
+					while (r == 0) {
+						prompt("Do you want to restart previous threads? (yes/no/all) ");
+						if (abbrev(buffer, "yes", 1)) {
+							r = 1;
+						} else if (abbrev(buffer, "no", 1)) {
+							r = 2;
+						} else if (abbrev(buffer, "all", 1)) {
+							r = 3;
+						}
+					}
+					if (r != 2) {
+						for (auto info : killedThreads) {
+							Script* script = getScriptByName(info.name);
+							if (script != NULL) {
+								int r2 = r == 3 ? 1 : 0;
+								while (r2 == 0) {
+									prompt("Restart %s(%s)? y or n ", info.name.c_str(), info.formatParameters().c_str());
+									if (abbrev(buffer, "yes", 1)) {
+										r2 = 1;
+									} else if (abbrev(buffer, "no", 1)) {
+										r2 = 2;
+									}
+								}
+								if (r2 == 1) {
+									//Push parameters on the stack
+									for (auto& param : info.parameters) {
+										ScriptLibraryR.PUSH(param.floatVal, param.type);
+									}
+									//Start the script
+									int taskNumber = ScriptLibraryR.StartScript(NULL, info.name.c_str(), 0xFFFFFFFF);
+									if (taskNumber == 0) {
+										printf("Failed to start script %s\n", info.name.c_str());
+									}
+								}
+							} else {
+								printf("Script '%s' has been removed\n", info.name.c_str());
+							}
+						}
+					}
+					killedThreads.clear();
+				}
+			}
+			captureKilledThreads = false;
+			return false;
+		}
+
 		static bool c_watch(char* rawBuffer, int argc, const char* cmd) {
 			if (argc >= 2) {
 				const char* sExpr = argv[1];
 				sExpr = rawBuffer + (sExpr - buffer);
-				//rejoinArgs(argv, argc, sExpr, NULL);
 				addWatch(currentFrame, sExpr);
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_whatis(char* rawBuffer, int argc, const char* cmd) {
 			if (argc >= 2) {
 				const char* sExpr = argv[1];
 				sExpr = rawBuffer + (sExpr - buffer);
-				//rejoinArgs(argv, argc, sExpr, NULL);
 				Script* script = getTaskScript(currentFrame);
 				Expression* expr = getCompiledExpression(script, sExpr, DT_AUTODETECT);
 				if (expr != NULL) {
 					printf("%s\n", datatype_names[expr->datatype]);
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_while(char* rawBuffer, int argc, const char* cmd) {
@@ -2494,11 +2790,10 @@ class Gdb : public Debugger {
 						commandQueue.insert(it, lines.begin(), lines.end());
 					}
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_x(char* rawBuffer, int argc, const char* cmd) {
@@ -2616,31 +2911,29 @@ class Gdb : public Debugger {
 						}
 					}
 				}
-				return false;
 			} else {
 				printf("Missing argument.\n");
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_help(char* rawBuffer, int argc, const char* cmd) {
 			if (argc < 2) {
 				//TODO
 				printf("Help not available\n");
-				return false;
 			} else {
 				char* topic = argv[1];
 				//TODO
 				printf("Help for \"%s\" not available\n", topic);
-				return false;
 			}
+			return false;
 		}
 
 		static bool c_userCommand(char* rawBuffer, int argc, const char* cmd) {
 			auto it = commandQueue.begin();
 			auto& ucmd = userCommands[cmd];
 			for (auto line : ucmd.commands) {
-				for (int i = 1; i < argc; i++) {
+				for (int i = argc - 1; i > 0; i--) {
 					line = strReplace(line, "$arg" + std::to_string(i - 1), argv[i]);
 				}
 				commandQueue.insert(it, line);
@@ -2660,6 +2953,8 @@ Breakpoint* Gdb::lastHitBreakpoint;
 char Gdb::lastPrintedFile[256];
 int Gdb::firstPrintedLine = 0;
 int Gdb::lastPrintedLine = 0;
+Task* Gdb::lastPrintedLineTask = NULL;
+int Gdb::lastPrintedLineIp = -1;
 
 Task* Gdb::currentFrame = NULL;
 int Gdb::compiledThreadId = 0;
@@ -2675,3 +2970,11 @@ bool Gdb::echo_on = false;
 
 std::vector<int> Gdb::blocks = std::vector<int>();
 int Gdb::inScript = 0;
+
+bool Gdb::captureKilledThreads = false;
+std::list<TaskInfo> Gdb::killedThreads = std::list<TaskInfo>();
+
+int Gdb::shell_exitcode_id = -1;
+
+HWND Gdb::gameWindow = NULL;
+HHOOK Gdb::keyHook = NULL;

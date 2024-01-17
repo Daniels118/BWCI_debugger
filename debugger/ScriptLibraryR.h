@@ -1,6 +1,8 @@
 #pragma once
 
 #include <iostream>
+#include <vector>
+#include <string>
 
 #include <Windows.h>
 
@@ -17,6 +19,22 @@ enum Opcodes {
 enum DataTypes {
 	DT_NONE, DT_INT, DT_FLOAT, DT_COORDS, DT_OBJECT, DT_UNK5, DT_BOOLEAN, DT_VAR
 };
+
+constexpr int OPCODES_COUNT = 45;
+
+extern DWORD opcode_attrs[OPCODES_COUNT];
+
+constexpr auto OP_ATTR_ARG = 1;
+constexpr auto OP_ATTR_IP = 2 | OP_ATTR_ARG;
+constexpr auto OP_ATTR_SCRIPT = 4 | OP_ATTR_ARG;
+constexpr auto OP_ATTR_JUMP = 8 | OP_ATTR_ARG | OP_ATTR_IP;
+constexpr auto OP_ATTR_FINT = 16;
+constexpr auto OP_ATTR_VSTACK = 32;
+
+extern std::vector<std::string> opcode_keywords[OPCODES_COUNT][3];
+
+extern const char* NativeFunctions[];
+constexpr auto NATIVE_COUNT = 528;
 
 enum VarTypes {
 	VAR_TYPE_REFERENCE = 1,	//?
@@ -71,11 +89,16 @@ struct Stack {
 	DWORD totalPop;
 };
 
-struct StringVector {
-	char* lastName;		// 0
-	char*** pFirst;		// 4  TODO: so many dereferences imply some intermediate struct
-	char*** pEnd;		// 8
-	char*** pBufferEnd;	//12
+struct VarDecl {
+	char* name;
+	char* scriptName;
+};
+
+struct VarDeclVector {
+	char* lastName;			// 0
+	VarDecl** pFirst;		// 4
+	VarDecl** pEnd;			// 8
+	VarDecl** pBufferEnd;	//12
 };
 
 struct Script {
@@ -83,7 +106,7 @@ struct Script {
 	char* name;					// 4
 	DWORD parameterCount;		// 8
 	char* filename;				//12
-	StringVector localVars;		//16 (16 bytes)
+	VarDeclVector localVars;	//16 (16 bytes)
 	DWORD instructionAddress;	//32
 	DWORD globalsCount;			//36
 	DWORD id;					//40
@@ -93,6 +116,16 @@ struct Script {
 struct ScriptEntry {
 	ScriptEntry* next;
 	Script* script;
+};
+
+struct AutostartScriptEntry {
+	AutostartScriptEntry* next;
+	int scriptId;
+};
+
+struct AutostartScriptsList {
+	AutostartScriptEntry* first;
+	int size;
 };
 
 struct VarVector {
@@ -154,7 +187,16 @@ typedef DWORD(__cdecl* OpcodeImpl)(Task* pTask, Instruction* pInstr);
 
 typedef int(__cdecl* ErrorCallback)(DWORD severity, const char* msg);
 
-typedef void UFILE;	//Fake type for FILEs handled using the statically linked C-runtime
+struct UFILE {	//Fake type for FILEs handled using the statically linked C-runtime
+	char*	_ptr;
+	int		_cnt;
+	char*	_base;
+	int		_flag;
+	int		_file;
+	int		_charbuf;
+	int		_bufsiz;
+	char*	_tmpfname;
+};
 
 //Instructions to NOP
 #define printParseErrorBeepOffset		0xC392
@@ -167,9 +209,11 @@ typedef void UFILE;	//Fake type for FILEs handled using the statically linked C-
 
 //DLL functions and fields
 #define loadGameHeadersOffset			0x2B00
+#define createArrayOffset				0x2BF0
 #define getVarTypeOffset				0x4740
 #define setVarTypeOffset				0x5FB0
 #define createVarOffset					0x5690
+#define addStringToDataSectionOffset	0x6470
 #define doStartScriptOffset				0x6550
 #define stopTask0Offset					0x6B80
 #define taskExistsOffset				0x68F0
@@ -191,6 +235,7 @@ typedef void UFILE;	//Fake type for FILEs handled using the statically linked C-
 #define mainStackOffset					0x447F8
 #define pTaskListOffset					0x44908
 #define numTasksOffset					0x4490C
+#define autostartScriptsListOffset		0x44910
 #define globalVarsDeclOffset			0x44920
 #define pGlobalVarsOffset				0x44938
 #define pGlobalVarsEndOffset			0x44940
@@ -268,9 +313,11 @@ struct ScriptLibraryRDll {
 	FUNC(pVersion, int(__cdecl* Version)());
 	//Internal functions
 	FUNC(pLoadGameHeaders, char(__cdecl* loadGameHeaders)(const char* gamePath));
+	FUNC(pCreateArray, int(__cdecl* createArray)(const char* name, int datatype, int size, int global));
 	FUNC(pGetVarType, int(__cdecl* getVarType)(int varId));
-	FUNC(pSetVarType, void(__cdecl* setVarType)(int type, int varId));	//type is VarTypes
-	FUNC(pCreateVar, int(__cdecl* createVar)(const char* varName, int type, const char* scriptName, int global));	//type is DataType
+	FUNC(pSetVarType, void(__cdecl* setVarType)(int vartype, int varId));
+	FUNC(pCreateVar, int(__cdecl* createVar)(const char* varName, int datatype, const char* scriptName, int global));
+	FUNC(pAddStringToDataSection, size_t(__cdecl* addStringToDataSection)(const char* str));
 	FUNC(pDoStartScript, DWORD(__cdecl* doStartScript)(Script* pScript));
 	FUNC(pStopTask0, int(__cdecl* stopTask0)(Task* pTask));
 	FUNC(pTaskExists, int(__cdecl* taskExists)(int taskNumber));
@@ -294,6 +341,7 @@ struct ScriptLibraryRDll {
 	ExceptStruct**		ppCurrentTaskExceptStruct;	//0x447E8
 	Stack*				pMainStack;					//0x447F8
 	TaskEntry**			pTaskList;					//0x44908
+	AutostartScriptsList* pAutostartScriptsList;	//0x44910
 	VarTypeEntry**		pGlobalVarsDecl;			//0x44920
 	VarVector*			globalVars;					//0x44938
 	ScriptEntry**		pScriptList;				//0x44958

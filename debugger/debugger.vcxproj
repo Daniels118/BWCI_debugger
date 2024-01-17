@@ -162,12 +162,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="assembler.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="resources.cpp" />
     <ClCompile Include="utils.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="assembler.h" />
     <ClInclude Include="bwfuncs.h" />
+    <ClInclude Include="CHLFile.h" />
     <ClInclude Include="debug.h" />
     <ClInclude Include="dllmain.h" />
     <ClInclude Include="gdb.h" />

@@ -20,9 +20,64 @@ enum CatchEvent {
 	EV_SYSCALL_RET,
 };
 
+class VarDef {
+	public:
+		int id;
+		std::string name;
+		size_t size = 1;
+
+		VarDef(int id, std::string name) {
+			this->id = id;
+			this->name = name;
+		}
+};
+
+class Parameter {
+	public:
+		std::string name;
+		int type;
+		union {
+			FLOAT floatVal;
+			int intVal;
+		};
+
+		Parameter(std::string name, int type) {
+			this->name = name;
+			this->type = type;
+			this->intVal = 0;
+		}
+
+		std::string toString() {
+			if (type == DataTypes::DT_FLOAT || type == DataTypes::DT_COORDS || type == DataTypes::DT_VAR) {
+				return std::to_string(floatVal);
+			} else {
+				return std::to_string(intVal);
+			}
+		}
+};
+
 class TaskInfo {
 	public:
+		int id;
+		std::string name;
+		std::vector<Parameter> parameters = std::vector<Parameter>();
 		bool exceptionMatched = false;
+
+		TaskInfo(int id, std::string name) {
+			this->id = id;
+			this->name = name;
+		}
+
+		std::string formatParameters() {
+			std::string res = "";
+			if (!parameters.empty()) {
+				res = parameters[0].toString();
+				for (size_t i = 1; i < parameters.size(); i++) {
+					res += ", " + parameters[i].toString();
+				}
+			}
+			return res;
+		}
 };
 
 class Expression {
@@ -186,18 +241,23 @@ typedef std::list<std::pair<DWORD, std::string>> ParserMessages;
 
 const char* findFilenameByIp(DWORD ip);
 
+const char* findStringData(std::string needle, const char* after, bool prefix);
+size_t getOrDefineString(const char* str);
+
 int getTotalInstructions();
 int findInstruction(DWORD startIp, DWORD opcode);
 int findInstructionIndex(const char* filename, const int linenumber);
 Instruction* getCurrentInstruction(Task* task);
 Instruction* getInstruction(int ip);
 
+std::list<Script*> getScripts();
 Script* findScriptByIp(DWORD ip);
 Script* getScriptById(int scriptId);
 Script* getScriptByName(std::string name);
 Script* getTaskScript(Task* task);
 
 int getGlobalVarsCount();
+std::list<VarDef> getGlobalVarDefs();
 int getLocalVarsCount(Task* task);
 
 int getGlobalVarId(const char* name, int index);
@@ -207,6 +267,7 @@ int getVarId(Script* script, const char* name);
 Var* getVar(Task* task, const char* name);
 Var* getVarById(Task* task, int id);
 Var* getBaseAndIndex(Task* task, int id, int* index);
+Var* getGlobalVarById(int id);
 Var* getGlobalVar(const char* name);
 Var* getLocalVar(Task* task, const char* name);
 
@@ -215,7 +276,9 @@ bool varIsLocal(Var* var, Task* task);
 bool varIsArray(Task* task, Var* var);
 int getVarSize(Task* task, Var* var);
 
-int declareGlobalVar(const char* name);
+int getOrDeclareGlobalVar(const char* name, size_t size);
+int declareGlobalVar(const char* name, size_t size);
+int addLocalVar(Task* task, const char* name, float value, size_t size);
 
 Task* getInnermostFrame(Task* task);
 int getFrameDepth(Task* task);
@@ -260,16 +323,21 @@ bool deleteWatch(Watch* watch);
 
 void jump(Task* task, int ip);
 
+bool stopThread(Task* thread);
+
+bool updateCHL(const char* filename);
+
 bool checkMessage(ParserMessages messages, DWORD minSeverity, std::string text);
 void throwParserMessages(ParserMessages messages);
 
 class Debugger {
 	public:
-		virtual void init() = 0;
-		virtual void start() = 0;
+		virtual void init() = 0;	//Called just once when the game has been initialized (during loading screen)
+		virtual void start() = 0;	//Called every time a CHL has been loaded (when starting new game or loading saved game)
+		virtual void term() = 0;	//Called just once when the program is being closed
 		virtual void threadStarted(Task* task) = 0;
 		virtual void threadResumed(Task* task) = 0;
-		virtual void threadEnded(Task* task) = 0;
+		virtual void threadEnded(void* pThread, TaskInfo* info) = 0;
 		virtual void breakpointHit(Task* task, Breakpoint* breakpoint) = 0;
 		virtual void onCatchpoint(Task* task, int event) = 0;
 		virtual void beforeInstruction(Task* task) = 0;
@@ -300,19 +368,6 @@ extern std::map<DWORD, std::string> scriptType_names;
 extern const char* datatype_names[8];
 extern char datatype_chars[8];
 extern const char* vartype_names[4];
-
-extern std::vector<std::string> opcode_keywords[45][3];
-extern DWORD opcode_attrs[45];
-
-constexpr auto OP_ATTR_ARG		= 1;
-constexpr auto OP_ATTR_IP		= 2 | OP_ATTR_ARG;
-constexpr auto OP_ATTR_SCRIPT	= 4 | OP_ATTR_ARG;
-constexpr auto OP_ATTR_JUMP		= 8 | OP_ATTR_ARG | OP_ATTR_IP;
-constexpr auto OP_ATTR_FINT		= 16;
-constexpr auto OP_ATTR_VSTACK	= 32;
-
-extern const char* NativeFunctions[];
-constexpr auto NATIVE_COUNT = 528;
 
 constexpr auto NOT_SET = 0;
 constexpr auto ENABLED = 1;
