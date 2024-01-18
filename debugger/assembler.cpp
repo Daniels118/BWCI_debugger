@@ -13,15 +13,17 @@ void assembler_init() {
 		//Build the mapping between mnemonics and sample instructions
 		for (int iCode = 0; iCode < OPCODES_COUNT; iCode++) {
 			auto& t = opcode_keywords[iCode];
-			for (int flags = 0; flags < 3; flags++) {
-				auto& t2 = t[flags];
+			for (int mode = 0; mode < 3; mode++) {
+				auto& t2 = t[mode];
 				for (size_t iType = 0; iType < t2.size(); iType++) {
 					std::string keyword = t2[iType];
-					if (keyword != "") {
+					if (keyword != "" && !model.contains(keyword)) {
 						Instruction instr;
 						instr.opcode = iCode;
-						instr.flags = flags;
+						instr.mode = mode;
 						instr.datatype = iType;
+						instr.intVal = 0;
+						instr.linenumber = 0;
 						model[keyword] = instr;
 					}
 				}
@@ -80,11 +82,11 @@ const char* assemble(Script* script, const int address, const char* str) {
 	if (!model.contains(keyword)) return "unknown instruction";
 	Instruction instr = model[keyword];	//This is safe since it copies the whole struct
 	DWORD attr = opcode_attrs[instr.opcode];
-	if ((attr & OP_ATTR_ARG) == OP_ATTR_ARG || (instr.opcode == Opcodes::CAST && instr.flags == 2)) {
+	if ((attr & OP_ATTR_ARG) == OP_ATTR_ARG || (instr.opcode == Opcodes::CAST && instr.mode == 2)) {
 		if (instr.opcode == Opcodes::POP) {
 			if (operand != NULL) {
 				if (instr.datatype == DataTypes::DT_FLOAT) {
-					instr.flags = 2;
+					instr.mode = 2;
 				}
 				char* base = operand;
 				int offset = 0;
@@ -127,7 +129,7 @@ const char* assemble(Script* script, const int address, const char* str) {
 				int ip = script->instructionAddress + atoi(operand);
 				instr.intVal = ip;
 				if ((attr & OP_ATTR_JUMP) == OP_ATTR_JUMP && ip > address) {
-					instr.flags = 2;
+					instr.mode = 2;
 				}
 			} else if ((attr & OP_ATTR_SCRIPT) == OP_ATTR_SCRIPT) {
 				Script* targetScript = getScriptByName(operand);
@@ -137,7 +139,7 @@ const char* assemble(Script* script, const int address, const char* str) {
 				operand++;
 				char* p = strchr(operand, ']');
 				if (p == NULL) return "Expected ']'";
-				instr.flags = 2;
+				instr.mode = 2;
 				char* base = operand;
 				int offset = 0;
 				char* sOffset = strchr(base, '+');
@@ -199,8 +201,8 @@ const char* assemble(Script* script, const int address, const char* str) {
 	}
 	Instruction* instruction = getInstruction(address);
 	instruction->opcode = instr.opcode;
+	instruction->mode = instr.mode;
 	instruction->datatype = instr.datatype;
-	instruction->flags = instr.flags;
 	instruction->intVal = instr.intVal;
 	return NULL;
 }

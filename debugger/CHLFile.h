@@ -17,7 +17,7 @@
 #undef LOG_LEVEL
 #undef PAUSE_ON
 #define __FILENAME__ "CHLFile.h"
-#define LOG_LEVEL 6
+#define LOG_LEVEL 4
 #define PAUSE_ON 0
 #include "logger.h"
 
@@ -807,10 +807,10 @@ bool UScript::operator==(UScript const& other) const {
 		}
 		//
 		if (instr1.opcode != instr2.opcode) return false;
-		if (instr1.flags != instr2.flags) return false;
+		if (instr1.mode != instr2.mode) return false;
 		if (instr1.datatype != instr2.datatype) return false;
 		int opcode = instr1.opcode;
-		DWORD flags = instr1.flags;
+		DWORD mode = instr1.mode;
 		DWORD attr = opcode_attrs[opcode];
 		if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
 			int relDst1 = instr1.intVal - offset1;
@@ -828,7 +828,7 @@ bool UScript::operator==(UScript const& other) const {
 				TRACE("instruction %i is a call to a different script ('%s' instead of '%s')", srcAddr, target2.name.c_str(), target1.name.c_str());
 				return false;
 			}
-		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (flags == 2 || instr1.datatype == DataTypes::DT_VAR)) {
+		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr1.datatype == DataTypes::DT_VAR)) {
 			const int id1 = instr1.datatype == DataTypes::DT_VAR ? (int)instr1.floatVal : instr1.intVal;
 			const int id2 = instr2.datatype == DataTypes::DT_VAR ? (int)instr2.floatVal : instr2.intVal;
 			std::string name1 = this->getVar(id1);

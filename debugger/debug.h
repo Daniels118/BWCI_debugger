@@ -18,6 +18,7 @@ enum CatchEvent {
 	EV_NONE,
 	EV_SYSCALL,
 	EV_SYSCALL_RET,
+	EV_RUN,
 };
 
 class VarDef {
@@ -292,6 +293,7 @@ Task* getTaskById(int taskId);
 
 void setSource(std::string filename, std::vector<std::string> lines);
 void unsetSource(std::string filename);
+void unsetMissingSources();
 std::vector<std::string> getSource(std::string filename);
 std::string getSourceLine(std::string filename, int lineno);
 std::string getCurrentSourceLine(Task* task);
@@ -353,6 +355,7 @@ extern std::set<std::string> sourcePath;
 extern Task* steppingThread;
 extern Task* catchThread;
 extern BYTE catchSysCalls[];
+extern std::set<std::string> catchRunScripts;
 extern DWORD breakFromAddress;
 extern int breakAfterLines;
 extern int breakAfterInstructions;

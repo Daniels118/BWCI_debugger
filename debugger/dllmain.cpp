@@ -26,7 +26,7 @@
 #undef LOG_LEVEL
 #undef PAUSE_ON
 #define __FILENAME__ "dllmain.cpp"
-#define LOG_LEVEL 6
+#define LOG_LEVEL 4
 #define PAUSE_ON 0
 #include "logger.h"
 
@@ -43,6 +43,7 @@ DWORD lastBreakLine;
 Task* steppingThread = NULL;
 Task* catchThread = NULL;
 BYTE catchSysCalls[NATIVE_COUNT];
+std::set<std::string> catchRunScripts;
 DWORD breakFromAddress = 0;
 int breakAfterLines = 0;
 int breakAfterInstructions = 0;
@@ -198,6 +199,16 @@ void unsetSource(std::string filename) {
 	sources.erase(filename);
 }
 
+void unsetMissingSources() {
+	for (auto it = sources.cbegin(); it != sources.cend(); ) {
+		if ((*it).second.empty()) {
+			sources.erase(it++);
+		} else {
+			++it;
+		}
+	}
+}
+
 std::vector<std::string> getSource(std::string filename) {
 	if (!sources.contains(filename)) {
 		TRACE("searching for %s", filename.c_str());
@@ -241,8 +252,7 @@ std::string getCurrentSourceLine(Task* task) {
 
 int findInstructionIndex(const char* filename, const int linenumber) {
 	bool fileFound = false;
-	ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList;
-	while (scriptEntry != NULL) {
+	for (ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
 		Script* script = scriptEntry->script;
 		if (streq(script->filename, filename)) {
 			fileFound = true;
@@ -254,7 +264,6 @@ int findInstructionIndex(const char* filename, const int linenumber) {
 				}
 			}
 		}
-		scriptEntry = scriptEntry->next;
 	}
 	return fileFound ? -1 : -2;
 }
@@ -262,7 +271,7 @@ int findInstructionIndex(const char* filename, const int linenumber) {
 Script* findScriptByIp(DWORD ip) {
 	Script* res = NULL;
 	DWORD resIp = 0;
-	for (ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
+	for (ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
 		Script* script = scriptEntry->script;
 		if (script->instructionAddress <= ip && script->instructionAddress >= resIp) {
 			res = script;
@@ -369,14 +378,14 @@ void formatTaskVar(Task* task, int id, char* buffer) {
 
 void formatInstruction(Script* script, Instruction* instr, char* buffer) {
 	DWORD opcode = instr->opcode;
-	DWORD flags = instr->flags;
+	DWORD mode = instr->mode;
 	int intVal = instr->intVal;
-	strcpy(buffer, opcode_keywords[opcode][instr->flags][instr->datatype].c_str());
+	strcpy(buffer, opcode_keywords[opcode][instr->mode][instr->datatype].c_str());
 	bool hasArg = (opcode_attrs[opcode] & OP_ATTR_ARG) == OP_ATTR_ARG;
 	bool popNull = opcode == POP && intVal == 0;
 	bool swapZero = opcode == SWAP && intVal == 0;
-	bool isZero = opcode == CAST && flags == 2;
-	bool isRef = (opcode == PUSH || opcode == POP || opcode == CAST) && flags == 2;
+	bool isZero = opcode == CAST && mode == 2;
+	bool isRef = (opcode == PUSH || opcode == POP || opcode == CAST) && mode == 2;
 	if (hasArg && !popNull && !swapZero || isZero) {
 		strcat(buffer, " ");
 		if (opcode == SYS) {
@@ -424,14 +433,14 @@ void formatInstruction(Script* script, Instruction* instr, char* buffer) {
 
 void formatTaskInstruction(Task* task, Instruction* instr, char* buffer) {
 	DWORD opcode = instr->opcode;
-	DWORD flags = instr->flags;
+	DWORD mode = instr->mode;
 	int intVal = instr->intVal;
-	strcpy(buffer, opcode_keywords[opcode][instr->flags][instr->datatype].c_str());
+	strcpy(buffer, opcode_keywords[opcode][instr->mode][instr->datatype].c_str());
 	bool hasArg = (opcode_attrs[opcode] & OP_ATTR_ARG) == OP_ATTR_ARG;
 	bool popNull = opcode == POP && intVal == 0;
 	bool swapZero = opcode == SWAP && intVal == 0;
-	bool isZero = opcode == CAST && flags == 2;
-	bool isRef = (opcode == PUSH || opcode == POP || opcode == CAST) && flags == 2;
+	bool isZero = opcode == CAST && mode == 2;
+	bool isRef = (opcode == PUSH || opcode == POP || opcode == CAST) && mode == 2;
 	if (hasArg && !popNull && !swapZero || isZero) {
 		strcat(buffer, " ");
 		if (opcode == SYS) {
@@ -771,7 +780,7 @@ std::vector<Task*> getThreads() {
 Task* getFrame(Task* thread) {
 	if (thread->waitingTask) {
 		std::map<int, Task*> tasksMap;
-		for (TaskEntry* taskEntry = *ScriptLibraryR.pTaskList; taskEntry != NULL; taskEntry = taskEntry->next) {
+		for (TaskEntry* taskEntry = ScriptLibraryR.pTaskList->pFirst; taskEntry != NULL; taskEntry = taskEntry->next) {
 			Task* t = taskEntry->task;
 			tasksMap[t->taskNumber] = t;
 		}
@@ -791,7 +800,7 @@ Task* getThread(Task* task) {
 }
 
 Task* getTaskById(int taskId) {
-	for (TaskEntry* taskEntry = *ScriptLibraryR.pTaskList; taskEntry != NULL; taskEntry = taskEntry->next) {
+	for (TaskEntry* taskEntry = ScriptLibraryR.pTaskList->pFirst; taskEntry != NULL; taskEntry = taskEntry->next) {
 		Task* t = taskEntry->task;
 		if (t->taskNumber == taskId) {
 			return t;
@@ -887,7 +896,7 @@ int ScriptLibraryR_RestoreState(int a1, char* FileName) {
 	onChlLoaded();
 	//Build tasks tree
 	std::map<int, Task*> parents;
-	for (TaskEntry* entry = *ScriptLibraryR.pTaskList; entry != NULL; entry = entry->next) {
+	for (TaskEntry* entry = ScriptLibraryR.pTaskList->pFirst; entry != NULL; entry = entry->next) {
 		Task* task = entry->task;
 		if (task->waitingTask > 0) {
 			tasksParents[task->waitingTask] = task;
@@ -897,7 +906,7 @@ int ScriptLibraryR_RestoreState(int a1, char* FileName) {
 		tasksInfo[task->taskNumber] = info;
 	}
 	//Build threads list
-	for (TaskEntry* entry = *ScriptLibraryR.pTaskList; entry != NULL; entry = entry->next) {
+	for (TaskEntry* entry = ScriptLibraryR.pTaskList->pFirst; entry != NULL; entry = entry->next) {
 		Task* task = entry->task;
 		if (!tasksParents.contains(task->taskNumber)) {
 			threads[task->taskNumber] = task;
@@ -905,6 +914,13 @@ int ScriptLibraryR_RestoreState(int a1, char* FileName) {
 		}
 	}
 	//
+	return r;
+}
+
+int ScriptLibraryR_Reboot() {
+	DEBUG("Reboot()");
+	int r = ScriptLibraryR.Reboot();
+	cleanup();
 	return r;
 }
 
@@ -979,9 +995,11 @@ void debugger_execute_pre(Task* task) {
 				}
 			}
 		}
-	} else if (instruction->opcode == SYS
+	} else if (instruction->opcode == Opcodes::SYS
 			&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal] == ENABLED) {
 		debugger->onCatchpoint(task, EV_SYSCALL);
+	} else if (instruction->opcode == Opcodes::CALL && catchRunScripts.contains(getScriptById(instruction->intVal)->name)) {
+		debugger->onCatchpoint(task, EV_RUN);
 	}
 }
 
@@ -1078,7 +1096,7 @@ char __cdecl ScriptLibraryR_lhvmCpuLoop(Task* task) {	//at 0x8DA0
 
 std::list<Script*> getScripts() {
 	std::list<Script*> res;
-	for (ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
+	for (ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
 		res.push_back(scriptEntry->script);
 	}
 	return res;
@@ -1086,7 +1104,7 @@ std::list<Script*> getScripts() {
 
 Script* getScriptById(int scriptId) {
 	if (!scripts.contains(scriptId)) {
-		for (ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
+		for (ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
 			Script* script = scriptEntry->script;
 			if (script->id == scriptId) {
 				scripts[scriptId] = script;
@@ -1100,7 +1118,7 @@ Script* getScriptById(int scriptId) {
 
 Script* getScriptByName(std::string name) {
 	if (!scriptsByName.contains(name)) {
-		for (ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
+		for (ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst; scriptEntry != NULL; scriptEntry = scriptEntry->next) {
 			Script* script = scriptEntry->script;
 			if (script->name == name) {
 				scriptsByName[name] = script;
@@ -1118,7 +1136,7 @@ Script* getTaskScript(Task* task) {
 }
 
 Task* isScriptRunning(int scriptId) {
-	for (TaskEntry* entry = *ScriptLibraryR.pTaskList; entry != NULL; entry = entry->next) {
+	for (TaskEntry* entry = ScriptLibraryR.pTaskList->pFirst; entry != NULL; entry = entry->next) {
 		Task* task = entry->task;
 		if (task->scriptID == scriptId) {
 			return task;
@@ -1142,7 +1160,7 @@ void deleteScript0(Script* script, bool releaseCode) {
 
 bool deleteScriptByName(const char* name) {
 	ScriptEntry* prevEntry = NULL;
-	for (ScriptEntry* entry = *ScriptLibraryR.pScriptList; entry != NULL; entry = entry->next) {
+	for (ScriptEntry* entry = ScriptLibraryR.pScriptList->pFirst; entry != NULL; entry = entry->next) {
 		Script* script = entry->script;
 		if (streq(script->name, name)) {
 			if (isScriptRunning(script->id)) {
@@ -1153,10 +1171,11 @@ bool deleteScriptByName(const char* name) {
 			deleteScript0(script, true);
 			ScriptLibraryR.free0(entry);
 			if (prevEntry == NULL) {
-				*ScriptLibraryR.pScriptList = entry->next;
+				ScriptLibraryR.pScriptList->pFirst = entry->next;
 			} else {
 				prevEntry->next = entry->next;
 			}
+			ScriptLibraryR.pScriptList->count--;
 			scriptsByName.erase(name);
 			return true;
 		}
@@ -1207,7 +1226,7 @@ bool relocateScript(Script* script, int dstIp) {
 int parseCode(const char* code, const char* filename) {
 	collectGarbage();
 	ScriptEntry* lastEntry = NULL;
-	ScriptEntry* entry = *ScriptLibraryR.pScriptList;
+	ScriptEntry* entry = ScriptLibraryR.pScriptList->pFirst;
 	while (entry != NULL) {
 		lastEntry = entry;
 		entry = entry->next;
@@ -1248,7 +1267,7 @@ int parseCode(const char* code, const char* filename) {
 		DEBUG("code compiled without errors");
 		//Insert the new scripts in a LIFO so we can read back them in reverse order
 		std::stack<Script*> scriptsToMove;
-		entry = lastEntry != NULL ? lastEntry->next : *ScriptLibraryR.pScriptList;
+		entry = lastEntry != NULL ? lastEntry->next : ScriptLibraryR.pScriptList->pFirst;
 		while (entry != NULL) {
 			scriptsToMove.push(entry->script);
 			entry = entry->next;
@@ -1281,7 +1300,7 @@ int parseCode(const char* code, const char* filename) {
 	} else {
 		DEBUG("compile failed with code %i", r);
 		//Delete new scripts compiled before errors occurred
-		entry = lastEntry != NULL ? lastEntry->next : *ScriptLibraryR.pScriptList;
+		entry = lastEntry != NULL ? lastEntry->next : ScriptLibraryR.pScriptList->pFirst;
 		while (entry != NULL) {
 			ScriptEntry* nextEntry = entry->next;
 			Script* script = entry->script;
@@ -1291,10 +1310,11 @@ int parseCode(const char* code, const char* filename) {
 			entry = nextEntry;
 		}
 		if (lastEntry == NULL) {
-			*ScriptLibraryR.pScriptList = NULL;
+			ScriptLibraryR.pScriptList->pFirst = NULL;
 		} else {
 			lastEntry->next = NULL;
 		}
+		ScriptLibraryR.pScriptList->count--;
 		if (getTotalInstructions() > prevInstructionsCount) {
 			DEBUG("shrinking code array from %i to %i instructions", getTotalInstructions(), prevInstructionsCount);
 			ScriptLibraryR.instructions->pEnd = ScriptLibraryR.instructions->pFirst + prevInstructionsCount;
@@ -1430,7 +1450,7 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	TRACE("code compiled without errors");
 	//Find the script just added (always the last)
 	ScriptEntry* prevEntry = NULL;
-	ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList;
+	ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst;
 	while (scriptEntry->next != NULL) {
 		prevEntry = scriptEntry;
 		scriptEntry = scriptEntry->next;
@@ -1459,12 +1479,12 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	DEBUG("expression compiled at IP %i, %i instructions", start, size);
 	//Remove the script entry and the script itself...
 	if (prevEntry == NULL) {
-		*ScriptLibraryR.pScriptList = NULL;
+		ScriptLibraryR.pScriptList->pFirst = NULL;
 	} else {
 		prevEntry->next = NULL;
 	}
+	ScriptLibraryR.pScriptList->count--;
 	ScriptLibraryR.free0(scriptEntry);
-	(*ScriptLibraryR.pScriptsCount)--;
 	(*ScriptLibraryR.pHighestScriptId)--;
 	deleteScript0(newScript, false);	//... without deleting the code
 	//
@@ -1765,7 +1785,7 @@ CHLFile makeCHL() {
 		chl.autoStartScripts.items.push_back(entry->scriptId);
 	}
 	//Scripts
-	for (ScriptEntry* entry = *ScriptLibraryR.pScriptList; entry != NULL; entry = entry->next) {
+	for (ScriptEntry* entry = ScriptLibraryR.pScriptList->pFirst; entry != NULL; entry = entry->next) {
 		Script* script = entry->script;
 		const int index = script->id - 1;
 		if ((int)chl.scriptsSection.items.size() <= index) {
@@ -1810,6 +1830,19 @@ bool stopThread(Task* thread) {
 	return true;
 }
 
+void removeScriptVars(Script* script) {
+	if (script->localVars.pFirst != 0) {
+		DEBUG("deallocating old local variables buffer");
+		for (VarDecl** pVar = script->localVars.pFirst; pVar < script->localVars.pEnd; pVar++) {
+			ScriptLibraryR.free0(*pVar);
+		}
+		ScriptLibraryR.free0(script->localVars.pFirst);
+		script->localVars.pFirst = 0;
+		script->localVars.pEnd = 0;
+		script->localVars.pBufferEnd = 0;
+	}
+}
+
 Script* createOrUpdateScript(UScript* uscript) {
 	Script* script = getScriptByName(uscript->name);
 	const bool isNew = script == NULL;
@@ -1824,16 +1857,7 @@ Script* createOrUpdateScript(UScript* uscript) {
 		script->filename = ScriptLibraryR._strdup(uscript->sourceFilename.c_str());
 	} else {
 		DEBUG("updating script '%s'", uscript->name.c_str());
-		if (script->localVars.pFirst != 0) {
-			DEBUG("deallocating old local variables buffer");
-			for (VarDecl** pVar = script->localVars.pFirst; pVar < script->localVars.pEnd; pVar++) {
-				ScriptLibraryR.free0(*pVar);
-			}
-			ScriptLibraryR.free0(script->localVars.pFirst);
-			script->localVars.pFirst = 0;
-			script->localVars.pEnd = 0;
-			script->localVars.pBufferEnd = 0;
-		}
+		removeScriptVars(script);
 		const int scriptSize = getScriptSize(script);
 		DEBUG("marking instructions %i -> %i as free space", script->instructionAddress, script->instructionAddress + scriptSize);
 		memoryManager.addFreeSpace(script->instructionAddress, scriptSize);
@@ -1905,13 +1929,13 @@ Script* createOrUpdateScript(UScript* uscript) {
 		//TRACE("relocating instruction %i", srcAddr);
 		*instr = *src;
 		int opcode = instr->opcode;
-		int flags = instr->flags;
+		int mode = instr->mode;
 		DWORD attr = opcode_attrs[opcode];
 		if (opcode == END) {
 			break;
 		} else if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
 			instr->intVal += offset;
-		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (flags == 2 || instr->datatype == DataTypes::DT_VAR)) {
+		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr->datatype == DataTypes::DT_VAR)) {
 			int varId = instr->datatype == DataTypes::DT_VAR ? (int)instr->floatVal : instr->intVal;
 			if (varId <= uscript->globalCount) {
 				int index = 0;
@@ -1969,7 +1993,7 @@ Script* createOrUpdateScript(UScript* uscript) {
 		ScriptEntry* newEntry = (ScriptEntry*)ScriptLibraryR.operator_new(sizeof(ScriptEntry));
 		newEntry->script = script;
 		newEntry->next = NULL;
-		ScriptEntry* entry = *ScriptLibraryR.pScriptList;
+		ScriptEntry* entry = ScriptLibraryR.pScriptList->pFirst;
 		ScriptEntry* lastEntry = NULL;
 		while (entry != NULL) {
 			lastEntry = entry;
@@ -1978,9 +2002,9 @@ Script* createOrUpdateScript(UScript* uscript) {
 		if (lastEntry != NULL) {
 			lastEntry->next = newEntry;
 		} else {
-			*ScriptLibraryR.pScriptList = newEntry;
+			ScriptLibraryR.pScriptList->pFirst = newEntry;
 		}
-		++(*ScriptLibraryR.pScriptsCount);
+		++ScriptLibraryR.pScriptList->count;
 		debugger->onMessage(1, "script '%s' added (ID remapped from %i to %i)", script->name, uscript->scriptID, script->id);
 	} else {
 		debugger->onMessage(1, "script '%s' updated", script->name);
@@ -2054,16 +2078,77 @@ bool updateCHL(const char* filename) {
 			TRACE("string added at %i: '%s'", offset, str.c_str());
 		}
 	}
-	//Remove deleted vars
-	//	too risky, skip
-	//Update changed vars (resizing)
-	for (auto var : diff.globalVars.changed) {
-		size_t p = var.find('/');
-		std::string name = var.substr(0, p);
-		int size = atoi(var.c_str() + p + 1);
-		//TODO
-		debugger->onMessage(3, "changing size of global variables is not supported (%s)", name.c_str());
-		return false;
+	//Remove deleted scripts (must be done before adding new global vars, otherwise may conflict)
+	DEBUG("removing %i deleted scripts", diff.scripts.removed.size());
+	for (auto name : diff.scripts.removed) {
+		Script* script = getScriptByName(name);
+		while (Task* task = isScriptRunning(script->id)) {
+			Task* thread = getThread(task);
+			DEBUG("script '%s' in use by thread %i", script->name, thread->taskNumber);
+			if (!stopThread(thread)) {
+				debugger->onMessage(3, "failed to stop thread");
+				return false;
+			}
+		}
+		deleteScriptByName(script->name);
+		DEBUG("script '%s' deleted", name.c_str());
+	}
+	//Remove local vars from changed scripts
+	DEBUG("removing local vars from %i changed scripts", diff.scripts.changed.size());
+	std::list<Script*> updatedScripts;
+	for (auto name : diff.scripts.changed) {
+		Script* script = getScriptByName(name);
+		//Stop all threads using the script
+		while (Task* task = isScriptRunning(script->id)) {
+			Task* thread = getThread(task);
+			DEBUG("script '%s' in use by thread %i", script->name, thread->taskNumber);
+			if (!stopThread(thread)) {
+				debugger->onMessage(3, "failed to stop thread");
+				return false;
+			}
+		}
+		//Remove local vars
+		removeScriptVars(script);
+		updatedScripts.push_back(script);
+	}
+	//Remove deleted global vars
+	DEBUG("removing %i global variables", diff.globalVars.removed.size());
+	for (auto name : diff.globalVars.removed) {
+		if (name.starts_with('_')) {
+			TRACE("variable '%s' retained");
+		} else {
+			Var* var = getGlobalVar(name.c_str());
+			if (var == NULL) {
+				WARNING("global variable '%s' not found", name.c_str());
+			} else {
+				memset((char*)var->name, ' ', strlen(var->name));
+				for (var++; var < ScriptLibraryR.globalVars->pEnd && streq(var->name, "LHVMA"); var++) {
+					memset((char*)var->name, ' ', strlen(var->name));
+				}
+			}
+		}
+	}
+	//Update changed global vars (resizing)
+	for (auto varDef : diff.globalVars.changed) {
+		size_t p = varDef.find('/');
+		std::string name = varDef.substr(0, p);
+		int newSize = atoi(varDef.c_str() + p + 1);
+		Var* var = getGlobalVar(name.c_str());
+		if (var == NULL) {
+			ERR("variable '%s' not found, it will be added", name.c_str());
+			diff.globalVars.added.insert(varDef);
+		} else {
+			const int oldSize = getVarSize(NULL, var);
+			if (newSize < 1) {
+				ERR("invalid new size for variable '%s': %i", name.c_str(), newSize);
+			} else if (newSize <= oldSize) {
+				TRACE("no need to shrink variable '%s'");
+			} else {
+				//TODO
+				debugger->onMessage(3, "increasing the size of global variables is not supported (%s)", name.c_str());
+				return false;
+			}
+		}
 	}
 	//Add new global vars
 	DEBUG("adding %i new global variables", diff.globalVars.added.size());
@@ -2079,41 +2164,16 @@ bool updateCHL(const char* filename) {
 			TRACE("global variable '%s' added with ID %i", name.c_str(), newId);
 		}
 	}
-	//Remove deleted scripts
-	DEBUG("removing %i deleted scripts", diff.scripts.removed.size());
-	for (auto name : diff.scripts.removed) {
-		Script* script = getScriptByName(name);
-		while (Task* task = isScriptRunning(script->id)) {
-			Task* thread = getThread(task);
-			DEBUG("script '%s' in use by thread %i", script->name, thread->taskNumber);
-			if (!stopThread(thread)) {
-				debugger->onMessage(3, "failed to stop thread");
-				return false;
-			}
-		}
-		deleteScriptByName(script->name);
-		DEBUG("script '%s' deleted", name.c_str());
-	}
 	//Update changed scripts
 	DEBUG("updating %i changed scripts", diff.scripts.changed.size());
-	std::list<Script*> updatedScripts;
 	for (auto name : diff.scripts.changed) {
 		Script* script = getScriptByName(name);
-		//Stop all threads using the script
-		while (Task* task = isScriptRunning(script->id)) {
-			Task* thread = getThread(task);
-			DEBUG("script '%s' in use by thread %i", script->name, thread->taskNumber);
-			if (!stopThread(thread)) {
-				debugger->onMessage(3, "failed to stop thread");
-				return false;
-			}
-		}
 		//Update the script
 		UScript* uscript = file2.scriptsSection.findScript(name);
 		if (createOrUpdateScript(uscript) == NULL) {
 			return false;
 		}
-		updatedScripts.push_back(script);
+		//updatedScripts.push_back(script);	already done in a previous step
 	}
 	//Add new scripts
 	DEBUG("adding %i new scripts", diff.scripts.added.size());
@@ -2383,8 +2443,8 @@ int __cdecl ScriptLibraryR_stopTask0(Task* pTask) {
 }
 
 DWORD __cdecl ScriptLibraryR_opcode_24_CALL(Task* pTask, Instruction* pInstr) {
-	if (pInstr->flags != 2) {
-		caller = pTask;	//flags != 2 means wait for the child task to terminate (sync call)
+	if (pInstr->mode != 2) {
+		caller = pTask;	//mode != 2 means wait for the child task to terminate (sync call)
 	}
 	DWORD taskId = ScriptLibraryR.opcode_24_CALL(pTask, pInstr);
 	return taskId;
@@ -2403,9 +2463,9 @@ int __cdecl errorCallback(DWORD severity, const char* msg) {
 	return 0;
 }
 
-int __cdecl ScriptLibraryR_Initialise(int a1, LPVOID pNativeFuncs, ErrorCallback errCallback, int a4, int a5, int a6, int a7) {
-	DEBUG("ScriptLibraryR.Initialise(%i, %p, %p, %i, %i, %i, %i)", a1, pNativeFuncs, errCallback, a4, a5, a6, a7);
-	int r = ScriptLibraryR.Initialise(a1, pNativeFuncs, errCallback, a4, a5, a6, a7);
+int __cdecl ScriptLibraryR_Initialise(int a1, LPVOID pNativeFuncs, ErrorCallback errCallback, NativeCallCallback nativeCallEnterCallback, NativeCallCallback nativeCallExitCallback, int a6, StopTaskCallback stopTaskCallback) {
+	DEBUG("ScriptLibraryR.Initialise(%i, %p, %p, %p, %p, %i, %p)", a1, pNativeFuncs, errCallback, nativeCallEnterCallback, nativeCallExitCallback, a6, stopTaskCallback);
+	int r = ScriptLibraryR.Initialise(a1, pNativeFuncs, errCallback, nativeCallEnterCallback, nativeCallExitCallback, a6, stopTaskCallback);
 	originalErrCallback = errCallback;
 	*ScriptLibraryR.pErrorCallback = errorCallback;
 	return r;
@@ -2516,12 +2576,11 @@ void initScriptLibraryR() {
 			ScriptLibraryR.instructions				= (InstructionVector*)(ScriptLibraryR.base + pInstructionsOffset);
 			ScriptLibraryR.ppCurrentTaskExceptStruct= (ExceptStruct**)	(ScriptLibraryR.base + pCurrentTaskExceptStructOffset);
 			ScriptLibraryR.pMainStack				= (Stack*)			(ScriptLibraryR.base + mainStackOffset);
-			ScriptLibraryR.pTaskList				= (TaskEntry**)		(ScriptLibraryR.base + pTaskListOffset);
+			ScriptLibraryR.pTaskList				= (TaskList*)		(ScriptLibraryR.base + pTaskListOffset);
 			ScriptLibraryR.pAutostartScriptsList	= (AutostartScriptsList*)(ScriptLibraryR.base + autostartScriptsListOffset);
 			ScriptLibraryR.pGlobalVarsDecl			= (VarTypeEntry**)	(ScriptLibraryR.base + globalVarsDeclOffset);
 			ScriptLibraryR.globalVars				= (VarVector*)		(ScriptLibraryR.base + pGlobalVarsOffset);
-			ScriptLibraryR.pScriptList				= (ScriptEntry**)	(ScriptLibraryR.base + pScriptListOffset);
-			ScriptLibraryR.pScriptsCount			= (int*)			(ScriptLibraryR.base + pScriptsCountOffset);
+			ScriptLibraryR.pScriptList				= (ScriptList*)		(ScriptLibraryR.base + pScriptListOffset);
 			ScriptLibraryR.ppDataSection			= (char**)			(ScriptLibraryR.base + pDataSectionOffset);
 			ScriptLibraryR.pDataSectionSize			= (DWORD*)			(ScriptLibraryR.base + dataSectionSizeOffset);
 			ScriptLibraryR.pTicksCount				= (DWORD*)			(ScriptLibraryR.base + ticksCountOffset);

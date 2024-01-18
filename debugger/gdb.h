@@ -69,6 +69,7 @@ class Gdb : public Debugger {
 		static int shell_exitcode_id;
 
 		static HWND gameWindow;
+		static HWND consoleWindow;
 		static HHOOK keyHook;
 
 	public:
@@ -86,8 +87,10 @@ class Gdb : public Debugger {
 		}
 
 		void init() {
-			if (GetConsoleWindow() == NULL) {
+			consoleWindow = GetConsoleWindow();
+			if (consoleWindow == NULL) {
 				AllocConsole();
+				consoleWindow = GetConsoleWindow();
 				FILE* t;
 				t = freopen("CONOUT$", "w", stdout);
 				t = freopen("CONIN$", "r", stdin);
@@ -95,11 +98,13 @@ class Gdb : public Debugger {
 			if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
 				printf("ERROR: cannot set control handler\n");
 			}
-			gameWindow = findProcessWindowExcluding(NULL, GetConsoleWindow());
+			//
+			gameWindow = findProcessWindowExcluding(NULL, consoleWindow);
 			keyHook = SetWindowsHookExW(WH_KEYBOARD, keyHookHandler, NULL, GetCurrentThreadId());
 			if (keyHook == NULL) {
 				printf("Failed to install keyboard hook.");
 			}
+			//
 			printf("\n");
 			printf("Debugging using gdb interface.\n");
 			printf("Press CTRL+C to break the execution and get a prompt. For help, type \"help\".\n");
@@ -244,7 +249,7 @@ class Gdb : public Debugger {
 						printf("\nScript execution interrupted.\n");
 					}
 					printf("\nPaused.\n");
-					if (*ScriptLibraryR.pTaskList != NULL && !gamePaused) {
+					if (ScriptLibraryR.pTaskList->count > 0 && !gamePaused) {
 						pause = true;
 					} else {
 						readAndExecuteCommand(NULL);
@@ -259,10 +264,7 @@ class Gdb : public Debugger {
 			if (code >= 0) {
 				if (wParam == 0x43 && lParam & 0x80000000 && GetKeyState(VK_CONTROL) & 0x8000) {	//CTRL+C (on keyup)
 					printf("\nPaused.\n");
-					HWND hwnd = GetConsoleWindow();
-					SetForegroundWindow(hwnd);
-					SetActiveWindow(hwnd);
-					if (*ScriptLibraryR.pTaskList != NULL && !gamePaused) {
+					if (ScriptLibraryR.pTaskList->count > 0 && !gamePaused) {
 						pause = true;
 					} else {
 						readAndExecuteCommand(NULL);
@@ -270,6 +272,20 @@ class Gdb : public Debugger {
 				}
 			}
 			return CallNextHookEx(NULL, code, wParam, lParam);
+		}
+
+		static void activateConsole() {
+			if (GetForegroundWindow() != consoleWindow) {
+				SetForegroundWindow(consoleWindow);
+				SetActiveWindow(consoleWindow);
+			}
+		}
+
+		static void activateGameWindow() {
+			if (GetForegroundWindow() != gameWindow) {
+				SetForegroundWindow(gameWindow);
+				SetActiveWindow(gameWindow);
+			}
 		}
 
 		static void checkTempScriptEnded() {
@@ -299,11 +315,18 @@ class Gdb : public Debugger {
 						Var* val = evalExpression(task, expr);
 						if (val != NULL) {
 							if (expr->datatype == DT_FLOAT) {
-								printf("%i: %s = %f\n", i, display->expression.c_str(), val->floatVal);
+								if (val->type == DT_OBJECT) {
+									printf("%i: %s = %u (object)\n", i, display->expression.c_str(), val->uintVal);
+								} else {
+									printf("%i: %s = %f\n", i, display->expression.c_str(), val->floatVal);
+								}
 							} else if (expr->datatype == DT_INT) {
-								printf("%i: %s = %i\n", i, display->expression.c_str(), val->intVal);
+								printf("%i: %s = %i\n", i, display->expression.c_str(), (int)val->floatVal);
 							} else if (expr->datatype == DT_BOOLEAN) {
-								printf("%i: %s = %s\n", i, display->expression.c_str(), val->intVal ? "true" : "false");
+								printf("%i: %s = %s\n", i, display->expression.c_str(), val->floatVal != 0.0f ? "true" : "false");
+							} else if (expr->datatype == DT_COORDS) {
+								printf("%i: %s = [%f, %f, %f]\n", i, display->expression.c_str(),
+										val[0].floatVal, val[1].floatVal, val[2].floatVal);
 							}
 						}
 					}
@@ -379,6 +402,7 @@ class Gdb : public Debugger {
 
 		static bool readCommand() {
 			if (commandQueue.empty()) {
+				activateConsole();
 				if (fgets(buffer, BUFFER_SIZE, stdin) != NULL) {
 					buffer[strcspn(buffer, "\r\n")] = 0;
 					return true;
@@ -401,6 +425,7 @@ class Gdb : public Debugger {
 				if (prompt("(gdb) ")) {
 					bool cont = processCommand();
 					if (cont) {
+						activateGameWindow();
 						break;
 					}
 				} else {
@@ -506,20 +531,29 @@ class Gdb : public Debugger {
 				}
 			}
 			expression = rawBuffer + (expression - buffer);
-			//rejoinArgs(argv, argc, expression, NULL);
 			Var* result = datatype == DT_COORDS ? NULL : getVar(currentFrame, expression);
 			if (result != NULL) {
-				datatype = varIsArray(currentFrame, result) ? DT_ARRAY : DT_FLOAT;
+				if (datatype == DT_AUTODETECT) {
+					datatype = varIsArray(currentFrame, result) ? DT_ARRAY : DT_FLOAT;
+				}
 			} else {
-				result = evalString(currentFrame, expression, datatype);
+				int inoutType = datatype;
+				result = evalString(currentFrame, expression, inoutType);
+				if (datatype == DT_AUTODETECT) {
+					datatype = inoutType;
+				}
 			}
 			if (result != NULL) {
 				if (datatype == DT_FLOAT) {
-					printf("%s%f%s", prefix, result->floatVal, suffix);
+					if (result->type == DT_OBJECT) {
+						printf("%s%u (object)%s", prefix, result->uintVal, suffix);
+					} else {
+						printf("%s%f%s", prefix, result->floatVal, suffix);
+					}
 				} else if (datatype == DT_INT) {
 					printf("%s%i%s", prefix, (int)result->floatVal, suffix);
 				} else if (datatype == DT_BOOLEAN) {
-					printf("%s%s%s", prefix, result->floatVal != 0.0 ? "true" : "false", suffix);
+					printf("%s%s%s", prefix, result->floatVal != 0.0f ? "true" : "false", suffix);
 				} else if (datatype == DT_COORDS) {
 					printf("%s[%f, %f, %f]%s", prefix, result[0].floatVal, result[1].floatVal, result[2].floatVal, suffix);
 				} else if (datatype == DT_ARRAY) {
@@ -551,7 +585,7 @@ class Gdb : public Debugger {
 				return c_advance(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "bt") || streq(cmd, "backtrace") || streq(cmd, "where")) {
 				return c_backtrace(rawBuffer, argc, cmd);
-			} else if (abbrev(cmd, "break", 1) || streq(cmd, "tbreak")) {
+			} else if (abbrev(cmd, "break", 1)) {
 				return c_break(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "call")) {
 				return c_call(rawBuffer, argc, cmd);
@@ -926,13 +960,31 @@ class Gdb : public Debugger {
 					catchThread = getThread(currentFrame);
 					printf("Exception catching enabled for current thread\n");
 				} else if (streq(arg, "syscall")) {
-					for (int j = 2; j < argc; j++) {
-						arg = argv[j];
-						for (int i = 0; i < NATIVE_COUNT; i++) {
-							if (streq(arg, NativeFunctions[i])) {
-								catchSysCalls[i] = ENABLED;
+					if (argc > 2) {
+						for (int j = 2; j < argc; j++) {
+							arg = argv[j];
+							for (int i = 0; i < NATIVE_COUNT; i++) {
+								if (_stricmp(arg, NativeFunctions[i]) == 0) {
+									catchSysCalls[i] = ENABLED;
+								}
 							}
 						}
+					} else {
+						printf("Missing argument.\n");
+					}
+				} else if (streq(arg, "run")) {
+					if (argc > 2) {
+						for (int j = 2; j < argc; j++) {
+							arg = argv[j];
+							Script* script = getScriptByName(arg);
+							if (script == NULL) {
+								printf("Script '%s' does not exist.\n", arg);
+							} else {
+								catchRunScripts.insert(arg);
+							}
+						}
+					} else {
+						printf("Missing argument.\n");
 					}
 				} else {
 					printf("Invalid event\n");
@@ -1216,10 +1268,16 @@ class Gdb : public Debugger {
 								if (catchSysCalls[i]) {
 									if (index-- == 0) {
 										catchSysCalls[i] = NOT_SET;
+										return false;
 									}
 								}
 							}
-							if (index >= 0) {
+							if (index < (int)catchRunScripts.size()) {
+								auto it = catchRunScripts.begin();
+								std::advance(it, index);
+								catchRunScripts.erase(it);
+							} else {
+								index -= catchRunScripts.size();
 								printf("Breakpoint not found\n");
 							}
 						}
@@ -1236,6 +1294,7 @@ class Gdb : public Debugger {
 				for (int i = 1; i < argc; i++) {
 					sourcePath.insert(argv[i]);
 				}
+				unsetMissingSources();	//There are chances that we can find sources now
 			} else {
 				//dir
 				//  clear source path
@@ -1375,11 +1434,14 @@ class Gdb : public Debugger {
 								if (catchSysCalls[i]) {
 									if (index-- == 0) {
 										catchSysCalls[i] = DISABLED;
-										break;
+										return false;
 									}
 								}
 							}
-							if (index >= 0) {
+							if (index < (int)catchRunScripts.size()) {
+								printf("Catchpoint for run can't be disabled, please use delete command.\n");
+							} else {
+								index -= catchRunScripts.size();
 								printf("Breakpoint not found\n");
 							}
 						}
@@ -1504,11 +1566,14 @@ class Gdb : public Debugger {
 								if (catchSysCalls[i]) {
 									if (index-- == 0) {
 										catchSysCalls[i] = ENABLED;
-										break;
+										return false;
 									}
 								}
 							}
-							if (index >= 0) {
+							if (index < (int)catchRunScripts.size()) {
+								//can't be disabled, just deleted
+							} else {
+								index -= catchRunScripts.size();
 								printf("Breakpoint not found\n");
 							}
 						}
@@ -1744,6 +1809,9 @@ class Gdb : public Debugger {
 					printf("%5i catchpoint %-8s %8i %s\n", index++, enabled, 0, NativeFunctions[i]);
 				}
 			}
+			for (std::string name : catchRunScripts) {
+				printf("%5i catchpoint %-8s %8i %s %s\n", index++, "enabled", 0, "run", name.c_str());
+			}
 			return false;
 		}
 
@@ -1849,7 +1917,7 @@ class Gdb : public Debugger {
 			//info sources
 			//  list all source files in use
 			std::unordered_set<std::string> printed;
-			ScriptEntry* scriptEntry = *ScriptLibraryR.pScriptList;
+			ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst;
 			while (scriptEntry != NULL) {
 				Script* script = scriptEntry->script;
 				if (!printed.contains(script->filename)) {
@@ -2257,7 +2325,6 @@ class Gdb : public Debugger {
 				printf("Missing argument.\n");
 				return false;
 			}
-			const HWND hwnd = GetConsoleWindow();
 			char* prop = argv[2];
 			if (abbrev(prop, "position", 3)) {
 				if (argc < 4) {
@@ -2265,7 +2332,7 @@ class Gdb : public Debugger {
 					return false;
 				}
 				char* sVal = argv[3];
-				setWindowPos(hwnd, sVal);
+				setWindowPos(consoleWindow, sVal);
 			} else if (streq(prop, "size")) {
 				if (argc < 4) {
 					printf("Missing argument.\n");
@@ -2278,20 +2345,20 @@ class Gdb : public Debugger {
 					int h = atoi(argv[1]);
 					if (w < 200) w = 200;
 					if (h < 100) h = 100;
-					SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+					SetWindowPos(consoleWindow, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
 				} else {
 					printf("Invalid size.\n");
 				}
 			} else if (streq(prop, "topmost")) {
-				SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+				SetWindowPos(consoleWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
 			} else if (streq(prop, "notopmost")) {
-				SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+				SetWindowPos(consoleWindow, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
 			} else if (streq(prop, "maximize")) {
-				ShowWindow(hwnd, SW_MAXIMIZE);
+				ShowWindow(consoleWindow, SW_MAXIMIZE);
 			} else if (streq(prop, "minimize")) {
-				ShowWindow(hwnd, SW_MINIMIZE);
+				ShowWindow(consoleWindow, SW_MINIMIZE);
 			} else if (streq(prop, "restore")) {
-				ShowWindow(hwnd, SW_RESTORE);
+				ShowWindow(consoleWindow, SW_RESTORE);
 			} else {
 				printf("Invalid property.\n");
 			}
@@ -2453,11 +2520,20 @@ class Gdb : public Debugger {
 							var->floatVal = 1.0;
 						} else if (streq(sValue, "false")) {
 							var->floatVal = 0.0;
+						} else if (strncmp(sValue, "(object)", 8) == 0) {
+							char* sNum = sValue + 8;
+							if (isNumber(sNum)) {
+								var->type = DT_OBJECT;
+								var->uintVal = (DWORD)atoll(sNum);
+							} else {
+								printf("Invalid number.\n");
+							}
 						} else {
 							int datatype = DT_FLOAT;
 							Var* res = evalString(currentFrame, sValue, datatype);
 							if (res != NULL) {
-								var->floatVal = res->floatVal;
+								var->type = res->type;
+								var->intVal = res->intVal;
 							}
 						}
 					} else {
@@ -2505,11 +2581,9 @@ class Gdb : public Debugger {
 						}
 					}
 				} else if (streq(arg, "console")) {
-					const HWND hwnd = GetConsoleWindow();
-					ShowWindow(hwnd, SW_SHOW);
+					ShowWindow(consoleWindow, SW_SHOW);
 				} else if (streq(arg, "window")) {
-					const HWND hwnd = findProcessWindowExcluding(NULL, GetConsoleWindow());
-					ShowWindow(hwnd, SW_SHOW);
+					ShowWindow(gameWindow, SW_SHOW);
 				} else {
 					printf("Invalid argument.\n");
 				}
@@ -2820,25 +2894,27 @@ class Gdb : public Debugger {
 						DWORD type = currentFrame->stack.types[i];
 						int id; Var* var; int index;
 						switch (type) {
-						case DT_FLOAT:
-						case DT_COORDS:
-							printf("%2i: %c %f\n", i, datatype_chars[type], currentFrame->stack.floatVals[i]);
-							break;
-						case DT_VAR:
-							id = (int)currentFrame->stack.floatVals[i];
-							var = getBaseAndIndex(currentFrame, id, &index);
-							if (var != NULL) {
-								if (varIsArray(currentFrame, var)) {
-									printf("%2i: v %i (&%s[%i])\n", i, id, var->name, index);
+							case DT_FLOAT:
+							case DT_COORDS:
+								printf("%2i: %c %f\n", i, datatype_chars[type], currentFrame->stack.floatVals[i]);
+								break;
+							case DT_VAR:
+								id = (int)currentFrame->stack.floatVals[i];
+								var = getBaseAndIndex(currentFrame, id, &index);
+								if (var != NULL) {
+									if (varIsArray(currentFrame, var)) {
+										printf("%2i: v %i (&%s[%i])\n", i, id, var->name, index);
+									} else {
+										printf("%2i: v %i (&%s)\n", i, id, var->name);
+									}
 								} else {
-									printf("%2i: v %i (&%s)\n", i, id, var->name);
+									printf("%2i: v %i (invalid var id)\n", i, id);
 								}
-							} else {
-								printf("%2i: v %i (invalid var id)\n", i, id);
-							}
-							break;
-						default:
-							printf("%2i: %c %i\n", i, datatype_chars[type], currentFrame->stack.intVals[i]);
+								break;
+							case DT_OBJECT:
+								printf("%2i: %c %u\n", i, datatype_chars[type], currentFrame->stack.uintVals[i]);
+							default:
+								printf("%2i: %c %i\n", i, datatype_chars[type], currentFrame->stack.intVals[i]);
 						}
 					}
 				} else {
@@ -2977,4 +3053,5 @@ std::list<TaskInfo> Gdb::killedThreads = std::list<TaskInfo>();
 int Gdb::shell_exitcode_id = -1;
 
 HWND Gdb::gameWindow = NULL;
+HWND Gdb::consoleWindow = NULL;
 HHOOK Gdb::keyHook = NULL;

@@ -92,7 +92,7 @@ DWORD opcode_attrs[OPCODES_COUNT] = {
 	/*25*/	0, 0, 0, 0,
 	/*29*/	OP_ATTR_ARG | OP_ATTR_FINT | OP_ATTR_VSTACK,
 	/*30*/	OP_ATTR_ARG,
-	/*31*/	OP_ATTR_ARG,
+	/*31*/	0,	//was OP_ATTR_ARG
 	/*32*/	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 

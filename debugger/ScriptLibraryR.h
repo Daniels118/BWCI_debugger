@@ -46,7 +46,8 @@ struct Var {
 	DWORD type;
 	union {
 		FLOAT floatVal;
-		DWORD intVal;
+		int intVal;
+		DWORD uintVal;
 	};
 	const char* name;
 };
@@ -61,9 +62,14 @@ struct VarTypeEntry {
 	VarType* pVarType;
 };
 
+struct VarTypeList {
+	VarTypeEntry* pFirst;
+	size_t count;
+};
+
 struct Instruction {
 	DWORD opcode;
-	DWORD flags;
+	DWORD mode;
 	DWORD datatype;
 	union {
 		FLOAT floatVal;
@@ -81,7 +87,8 @@ struct InstructionVector {
 struct Stack {
 	DWORD count;
 	union {
-		DWORD intVals[32];
+		int intVals[32];
+		DWORD uintVals[32];
 		FLOAT floatVals[32];
 	};
 	DWORD types[32];
@@ -116,6 +123,11 @@ struct Script {
 struct ScriptEntry {
 	ScriptEntry* next;
 	Script* script;
+};
+
+struct ScriptList {
+	ScriptEntry* pFirst;
+	size_t count;
 };
 
 struct AutostartScriptEntry {
@@ -178,14 +190,20 @@ struct TaskEntry {
 	Task* task;
 };
 
+struct TaskList {
+	TaskEntry* pFirst;
+	size_t count;
+};
+
 struct TaskVar {
 	int taskId;
 	int varId;
 };
 
 typedef DWORD(__cdecl* OpcodeImpl)(Task* pTask, Instruction* pInstr);
-
 typedef int(__cdecl* ErrorCallback)(DWORD severity, const char* msg);
+typedef int(__cdecl* NativeCallCallback)(DWORD id);
+typedef int(__cdecl* StopTaskCallback)(DWORD taskNumber);
 
 struct UFILE {	//Fake type for FILEs handled using the statically linked C-runtime
 	char*	_ptr;
@@ -234,15 +252,12 @@ struct UFILE {	//Fake type for FILEs handled using the statically linked C-runti
 #define pCurrentTaskExceptStructOffset	0x447E8
 #define mainStackOffset					0x447F8
 #define pTaskListOffset					0x44908
-#define numTasksOffset					0x4490C
 #define autostartScriptsListOffset		0x44910
 #define globalVarsDeclOffset			0x44920
 #define pGlobalVarsOffset				0x44938
 #define pGlobalVarsEndOffset			0x44940
 #define varTypesListOffset				0x44950
-#define varTypesCountOffset				0x44954
 #define pScriptListOffset				0x44958
-#define pScriptsCountOffset				0x4495C
 #define pDataSectionOffset				0x44964
 #define dataSectionSizeOffset			0x44968
 #define ticksCountOffset				0x4496C
@@ -265,11 +280,11 @@ struct ScriptLibraryRDll {
 		uintptr_t base;
 	};
 	//Exported functions
-	FUNC(pAutoStart, int(__cdecl* AutoStart)());
+	FUNC(pAutoStart, int(__cdecl* AutoStart)());	//Start autostart scripts
 	FUNC(pCodeSize, int(__cdecl* CodeSize)());
 	FUNC(pFindScript, int(__cdecl* FindScript)(int, char* name));
 	FUNC(pGetCurrentScriptType, int(__cdecl* GetCurrentScriptType)());
-	FUNC(pGetFirstRunningTaskId, int(__cdecl* GetFirstRunningTaskId)(int, int a2));
+	FUNC(pGetFirstRunningTaskId, int(__cdecl* GetFirstRunningTaskId)(int, char* name));
 	FUNC(pGetGlobalVariableValue, float(__cdecl* GetGlobalVariableValue)(int, const char* name));
 	FUNC(pGetHighestRunningTask, int(__cdecl* GetHighestRunningTask)());		//Returns the taskId
 	FUNC(pGetLocalVariableValue, float(__cdecl* GetLocalVariableValue)(int, const char* scriptName, const char* varName));
@@ -280,10 +295,12 @@ struct ScriptLibraryRDll {
 	FUNC(pGetScriptType, int(__cdecl* GetScriptType)(int, int taskId));
 	FUNC(pGetTaskFilename, const char* (__cdecl* GetTaskFilename)(int, int scriptIndex));	//WARNING: here task means script
 	FUNC(pGetTaskName, const char* (__cdecl* GetTaskName)(int, int taskId));
-	FUNC(pInitialise, int(__cdecl* Initialise)(int a1, LPVOID pNativeFunctions, ErrorCallback errCallback, int a4, int a5, int a6, int a7));
+	FUNC(pInitialise, int(__cdecl* Initialise)(int a1, LPVOID pNativeFunctions, ErrorCallback errCallback,
+												NativeCallCallback nativeCallEnterCallback, NativeCallCallback nativeCallExitCallback,
+												int a6, StopTaskCallback stopTaskCallback));
 	FUNC(pLineNumber, int(__cdecl* LineNumber)());
 	FUNC(pLoadBinary, int(__cdecl* LoadBinary)(int a1, const char* FileName));
-	FUNC(pLookIn, int(__cdecl* LookIn)(int, int flag));
+	FUNC(pLookIn, int(__cdecl* LookIn)(int, int flag));	//Executes a turn of the task scheduler (should be called each 100 ms)
 	FUNC(pLoopGlobalVariables, int(__cdecl* LoopGlobalVariables)(int, int(__cdecl* callback)(char* name, DWORD type, float value)));
 	FUNC(pLoopTaskVariables, int(__cdecl* LoopTaskVariables)(int, int(__cdecl* callback)(char* name, DWORD type, float value), int taskId));
 	FUNC(pMode, int(__cdecl* Mode)());
@@ -340,12 +357,11 @@ struct ScriptLibraryRDll {
 	InstructionVector*	instructions;				//0x447DC
 	ExceptStruct**		ppCurrentTaskExceptStruct;	//0x447E8
 	Stack*				pMainStack;					//0x447F8
-	TaskEntry**			pTaskList;					//0x44908
+	TaskList*			pTaskList;					//0x44908
 	AutostartScriptsList* pAutostartScriptsList;	//0x44910
 	VarTypeEntry**		pGlobalVarsDecl;			//0x44920
 	VarVector*			globalVars;					//0x44938
-	ScriptEntry**		pScriptList;				//0x44958
-	int*				pScriptsCount;				//0x4495C
+	ScriptList*			pScriptList;				//0x44958
 	char**				ppDataSection;				//0x44964
 	DWORD*				pDataSectionSize;			//0x44968
 	DWORD*				pTicksCount;				//0x4496C
