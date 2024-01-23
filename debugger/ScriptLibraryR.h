@@ -237,6 +237,8 @@ struct UFILE {	//Fake type for FILEs handled using the statically linked C-runti
 #define taskExistsOffset				0x68F0
 #define readTaskOffset					0x8310
 #define lhvmCpuLoopOffset				0x8DA0
+#define addReferenceOffset				0x94A0
+#define removeReferenceOffset			0x94D0
 #define opcode_24_CALL_Offset			0xB4A0
 #define getExceptionHandlersCountOffset	0xB920
 #define getExceptionHandlerCurrentIpOffset 0xB940
@@ -318,7 +320,7 @@ struct ScriptLibraryRDll {
 	FUNC(pSaveState, int(__cdecl* SaveState)(int a1, const char* FileName));
 	FUNC(pStartScript, int(__cdecl* StartScript)(int, const char* scriptName, int allowedScriptTypesBitmask));
 	FUNC(pStopAllTasks, int(__cdecl* StopAllTasks)());
-	FUNC(pStopScripts, int(__cdecl* StopScripts)(int, unsigned __int8(__cdecl* filterFunction)(DWORD, DWORD)));
+	FUNC(pStopScripts, int(__cdecl* StopScripts)(int, bool(__cdecl* filterFunction)(const char* scriptName, const char* filename)));
 	FUNC(pStopTask, int(__cdecl* StopTask)(int, int taskId));
 	FUNC(pStopTasksOfType, int(__cdecl* StopTasksOfType)(int, int scriptTypesBitmask));
 	FUNC(pTaskFilename, const char* (__cdecl* TaskFilename)());
@@ -340,6 +342,8 @@ struct ScriptLibraryRDll {
 	FUNC(pTaskExists, int(__cdecl* taskExists)(int taskNumber));
 	FUNC(pReadTask, Script*(__cdecl* readTask)(Task* pTask, void* pStream));
 	FUNC(pLhvmCpuLoop, char(__cdecl* lhvmCpuLoop)(int a1));
+	FUNC(pAddReference, DWORD(__cdecl* addReference)(DWORD objId));
+	FUNC(pRemoveReference, DWORD(__cdecl* removeReference)(DWORD objId));
 	FUNC(pOpcode_24_CALL, OpcodeImpl opcode_24_CALL);
 	FUNC(pGetExceptionHandlersCount, int(__cdecl* getExceptionHandlersCount)());
 	FUNC(pGetExceptionHandlerCurrentIp, int(__cdecl* getExceptionHandlerCurrentIp)(int exceptionHandlerIndex));

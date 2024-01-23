@@ -136,12 +136,7 @@ class Gdb : public Debugger {
 			if (pThread == catchThread) {
 				catchThread = NULL;
 			}
-			if (!runningCompileCommand) {
-				printf("Thread %i \"%s\" ended\n", info->id, info->name.c_str());
-				if (captureKilledThreads) {
-					killedThreads.push_back(*info);
-				}
-			} else if (info->id == compiledThreadId) {
+			if (info->id == compiledThreadId) {
 				if (deleteScriptByName("_gdb_expr_")) {
 					unsetSource("__debugger_compile");
 				}
@@ -152,6 +147,11 @@ class Gdb : public Debugger {
 					compiledThreadId = 0;
 					runningCompileCommand = false;
 					readAndExecuteCommand(NULL);
+				}
+			} else {
+				printf("Thread %i \"%s\" ended\n", info->id, info->name.c_str());
+				if (captureKilledThreads) {
+					killedThreads.push_back(*info);
 				}
 			}
 		}
@@ -1127,12 +1127,15 @@ class Gdb : public Debugger {
 						}
 						std::string absFilename = searchPaths(sourcePath, expr);
 						if (absFilename == "") {
-							printf("File not found.\n");
+							printf("File '%s' not found.\n", expr);
 							return false;
 						} else {
 							auto filelines = readFile(absFilename);
 							lines.insert(lines.end(), filelines.begin(), filelines.end());
 						}
+					} else {
+						printf("Expected 'code' or 'file'.\n");
+						return false;
 					}
 					if (!raw) {
 						lines.push_back("end script _gdb_expr_");
@@ -1845,8 +1848,9 @@ class Gdb : public Debugger {
 							params += ", " + std::string(script->localVars.pFirst[i]->name);
 						}
 					}
-					printf("%i: %s(%s) at %i from '%s'\n", script->id, script->name, params.c_str(),
-							script->instructionAddress, script->filename);
+					Instruction* instr = getInstruction(script->instructionAddress);
+					printf("%i: %s(%s) at %i from '%s:%i'\n", script->id, script->name, params.c_str(),
+							script->instructionAddress, script->filename, instr->linenumber);
 				}
 			}
 			return false;
@@ -2516,9 +2520,14 @@ class Gdb : public Debugger {
 						}
 					}
 					if (var != NULL) {
+						if (var->type == DataTypes::DT_OBJECT) {
+							ScriptLibraryR.removeReference(var->uintVal);
+						}
 						if (streq(sValue, "true")) {
+							var->type = DataTypes::DT_FLOAT;
 							var->floatVal = 1.0;
 						} else if (streq(sValue, "false")) {
+							var->type = DataTypes::DT_FLOAT;
 							var->floatVal = 0.0;
 						} else if (strncmp(sValue, "(object)", 8) == 0) {
 							char* sNum = sValue + 8;
@@ -2533,8 +2542,11 @@ class Gdb : public Debugger {
 							Var* res = evalString(currentFrame, sValue, datatype);
 							if (res != NULL) {
 								var->type = res->type;
-								var->intVal = res->intVal;
+								var->uintVal = res->uintVal;
 							}
+						}
+						if (var->type == DataTypes::DT_OBJECT) {
+							ScriptLibraryR.addReference(var->uintVal);
 						}
 					} else {
 						Script* script = getTaskScript(currentFrame);
@@ -2600,7 +2612,7 @@ class Gdb : public Debugger {
 				//rejoinArgs(argv, argc, filename, NULL);
 				std::string absFilename = searchPaths(sourcePath, filename);
 				if (absFilename == "") {
-					printf("File not found.\n");
+					printf("File '%s' not found.\n", filename);
 				} else {
 					FILE* file = fopen(absFilename.c_str(), "rt");
 					if (file == NULL) {
@@ -2757,9 +2769,10 @@ class Gdb : public Debugger {
 		}
 
 		static bool c_updateChl(char* rawBuffer, int argc, const char* cmd) {
-			const char* filename = argc >= 2 ? argv[1] : NULL;
+			bool all = getArgFlag(argv, argc, "-all");
+			const char* filename = getArgVal(argv, argc, "-f");
 			captureKilledThreads = true;
-			if (updateCHL(filename)) {
+			if (updateCHL(filename, all)) {
 				if (!killedThreads.empty()) {
 					int r = 0;
 					while (r == 0) {

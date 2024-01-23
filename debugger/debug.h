@@ -327,7 +327,7 @@ void jump(Task* task, int ip);
 
 bool stopThread(Task* thread);
 
-bool updateCHL(const char* filename);
+bool updateCHL(const char* filename, bool stopAllInChangedFiles);
 
 bool checkMessage(ParserMessages messages, DWORD minSeverity, std::string text);
 void throwParserMessages(ParserMessages messages);

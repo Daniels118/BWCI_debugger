@@ -79,6 +79,8 @@ int debugger_result_z_id;
 
 bool gamePaused = false;
 
+const char* scriptsToStopFilename = NULL;
+
 
 int __cdecl errorCallback(DWORD severity, const char* msg);
 int getScriptSize(Script* script);
@@ -1169,12 +1171,12 @@ bool deleteScriptByName(const char* name) {
 			}
 			debugger->onMessage(1, "Script '%s' deleted.", script->name);
 			deleteScript0(script, true);
-			ScriptLibraryR.free0(entry);
 			if (prevEntry == NULL) {
 				ScriptLibraryR.pScriptList->pFirst = entry->next;
 			} else {
 				prevEntry->next = entry->next;
 			}
+			ScriptLibraryR.free0(entry);
 			ScriptLibraryR.pScriptList->count--;
 			scriptsByName.erase(name);
 			return true;
@@ -1420,7 +1422,6 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 				"	__debugger_result_x = SCRIPT_OBJECT_PROPERTY_TYPE_XPOS of __debugger_result\n"
 				"	__debugger_result_y = SCRIPT_OBJECT_PROPERTY_TYPE_YPOS of __debugger_result\n"
 				"	__debugger_result_z = SCRIPT_OBJECT_PROPERTY_TYPE_ZPOS of __debugger_result\n"
-				"	delete __debugger_result\n"
 				"end script %1$s";
 			break;
 		default:
@@ -1931,55 +1932,91 @@ Script* createOrUpdateScript(UScript* uscript) {
 		int opcode = instr->opcode;
 		int mode = instr->mode;
 		DWORD attr = opcode_attrs[opcode];
-		if (opcode == END) {
-			break;
-		} else if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
-			instr->intVal += offset;
-		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr->datatype == DataTypes::DT_VAR)) {
-			int varId = instr->datatype == DataTypes::DT_VAR ? (int)instr->floatVal : instr->intVal;
-			if (varId <= uscript->globalCount) {
-				int index = 0;
-				std::string& name = uscript->chl->globalVariables.names[--varId];
-				while (name == "LHVMA") {
-					varId--;
-					index++;
-					if (varId < 0) {
-						debugger->onMessage(4, "Fatal error: array without base");
-						varId = 0;
+		if (opcode == END) break;
+		bool popNull = opcode == Opcodes::POP && instr->intVal == 0;
+		if ((attr & OP_ATTR_ARG) == OP_ATTR_ARG && !popNull) {
+			if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
+				instr->intVal += offset;
+			} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr->datatype == DataTypes::DT_VAR)) {
+				int varId = instr->datatype == DataTypes::DT_VAR ? (int)instr->floatVal : instr->intVal;
+				if (varId <= uscript->globalCount) {
+					int index = 0;
+					std::string& name = uscript->chl->globalVariables.names[--varId];
+					while (name == "LHVMA") {
+						varId--;
+						index++;
+						if (varId < 0) {
+							debugger->onMessage(4, "Fatal error: array without base");
+							varId = 0;
+						}
+						name = uscript->chl->globalVariables.names[varId - 1];
 					}
-					name = uscript->chl->globalVariables.names[varId - 1];
-				}
-				varId = getGlobalVarId(name.c_str(), index);
-				if (varId < 0) {
-					debugger->onMessage(4, "Fatal error: cannot find global variable '%s'", name.c_str());
-					varId = 0;
+					varId = getGlobalVarId(name.c_str(), index);
+					if (varId < 0) {
+						debugger->onMessage(4, "Fatal error: cannot find global variable '%s'", name.c_str());
+						varId = 0;
+					} else {
+						TRACE("instruction %i references global var '%s'", srcAddr, name.c_str());
+					}
 				} else {
-					TRACE("instruction %i references global var '%s'", srcAddr, name.c_str());
+					varId = varId - uscript->globalCount + script->globalsCount;
 				}
-			} else {
-				varId = varId - uscript->globalCount + script->globalsCount;
-			}
-			if (instr->datatype == DataTypes::DT_VAR) {
-				instr->floatVal = (float)varId;
-			} else {
-				instr->intVal = varId;
-			}
-		} else if (instr->datatype == DataTypes::DT_INT) {
-			while (srcAddr > stringInstr) {
-				stringInstructionIt++;
-				stringInstr = stringInstructionIt != stringInstructionEnd ? *stringInstructionIt : 0x7FFFFFFF;
-				TRACE("next instruction to compare as string reference: %u", stringInstr);
-			}
-			if (srcAddr == stringInstr) {
-				TRACE("comparing instruction %u as string reference", srcAddr);
-				const char* str = uscript->chl->data.getString(instr->intVal);
-				const char* newStr = findStringData(str, NULL, false);
-				if (newStr == NULL) {
-					debugger->onMessage(4, "Fatal error: cannot find string '%s'", str);
-					instr->intVal = 0;
+				if (instr->datatype == DataTypes::DT_VAR) {
+					instr->floatVal = (float)varId;
 				} else {
-					instr->intVal = newStr - *ScriptLibraryR.ppDataSection;
-					TRACE("string '%s' found at offset %u", str, instr->intVal);
+					instr->intVal = varId;
+				}
+			} else if (opcode == Opcodes::PUSH && instr->datatype == DataTypes::DT_INT) {
+				while (srcAddr > stringInstr) {
+					stringInstructionIt++;
+					stringInstr = stringInstructionIt != stringInstructionEnd ? *stringInstructionIt : 0x7FFFFFFF;
+					TRACE("next instruction to compare as string reference: %u", stringInstr);
+				}
+				if (srcAddr == stringInstr) {
+					TRACE("comparing instruction %u as string reference", srcAddr);
+					const char* str = uscript->chl->data.getString(instr->intVal);
+					const char* newStr = findStringData(str, NULL, false);
+					if (newStr == NULL) {
+						debugger->onMessage(4, "Fatal error: cannot find string '%s'", str);
+						instr->intVal = 0;
+					} else {
+						instr->intVal = newStr - *ScriptLibraryR.ppDataSection;
+						TRACE("string '%s' found at offset %u", str, instr->intVal);
+					}
+				}
+			}
+		} else if (opcode == Opcodes::REF_PUSH && mode == 2) {
+			if (instr - 2 < ScriptLibraryR.instructions->pFirst) {
+				debugger->onMessage(4, "Fatal error: missing instructions before REF_PUSH2");
+			} else {
+				Instruction* instr2 = instr - 2;
+				if (instr2->opcode != Opcodes::PUSH || instr2->datatype != DataTypes::DT_FLOAT || instr2->mode != 1) {
+					debugger->onMessage(4, "Fatal error: expected PUSHF 2 lines before REF_PUSH2");
+				} else {
+					int varId = (int)instr2->floatVal;
+					if (varId <= uscript->globalCount) {
+						int index = 0;
+						std::string& name = uscript->chl->globalVariables.names[--varId];
+						while (name == "LHVMA") {
+							varId--;
+							index++;
+							if (varId < 0) {
+								debugger->onMessage(4, "Fatal error: array without base");
+								varId = 0;
+							}
+							name = uscript->chl->globalVariables.names[varId - 1];
+						}
+						varId = getGlobalVarId(name.c_str(), index);
+						if (varId < 0) {
+							debugger->onMessage(4, "Fatal error: cannot find global variable '%s'", name.c_str());
+							varId = 0;
+						} else {
+							TRACE("instruction %i references global var '%s'", srcAddr, name.c_str());
+						}
+					} else {
+						varId = varId - uscript->globalCount + script->globalsCount;
+					}
+					instr2->floatVal = (float)varId;
 				}
 			}
 		}
@@ -2012,7 +2049,11 @@ Script* createOrUpdateScript(UScript* uscript) {
 	return script;
 }
 
-bool updateCHL(const char* filename) {
+bool stopScriptsInFile(const char* scriptName, const char* filename) {
+	return streq(filename, scriptsToStopFilename);
+}
+
+bool updateCHL(const char* filename, bool stopAllInChangedFiles) {
 	if (filename == NULL) {
 		filename = chlFilename;
 		DEBUG("updating CHL from '%s'", filename);
@@ -2027,8 +2068,10 @@ bool updateCHL(const char* filename) {
 	//Clear old debug info
 	DEBUG("clearing old debug info");
 	char* string_instructions = (char*)findStringData("string_instructions=", NULL, true);
-	if (string_instructions != NULL) {
+	while (string_instructions != NULL) {
+		char* next = (char*)findStringData("string_instructions=", string_instructions, true);
 		memset(string_instructions, 0, strlen(string_instructions));
+		string_instructions = next;
 	}
 	for (auto name : diff.sources.removed) {
 		char* crc = (char*)findStringData("crc32[" + name + "]=", NULL, true);
@@ -2039,20 +2082,25 @@ bool updateCHL(const char* filename) {
 		unsetSource(name);
 	}
 	for (auto name : diff.sources.changed) {
-		char* crc = (char*)findStringData("crc32[" + name + "]=", NULL, true);
-		if (crc != NULL) {
-			const char* newCrc = file2.data.findByPrefix("crc32[" + name + "]=");
-			if (newCrc != NULL && strlen(newCrc) == strlen(crc)) {
-				strcpy(crc, newCrc);
+		const char* newCrc = file2.data.findByPrefix("crc32[" + name + "]=", NULL);
+		if (newCrc != NULL) {
+			char* oldCrc = (char*)findStringData("crc32[" + name + "]=", NULL, true);
+			if (oldCrc != NULL) {
+				if (strlen(newCrc) <= strlen(oldCrc)) {
+					strcpy(oldCrc, newCrc);
+				} else {
+					memset(oldCrc, 0, strlen(oldCrc));
+					ScriptLibraryR.addStringToDataSection(newCrc);
+				}
 				TRACE("CRC updated for source file '%s'", name.c_str());
 			} else {
-				memset(crc, 0, strlen(crc));
+				ScriptLibraryR.addStringToDataSection(newCrc);
 			}
 		}
 		unsetSource(name);
 	}
 	for (auto name : diff.sources.added) {
-		const char* newCrc = file2.data.findByPrefix("crc32[" + name + "]=");
+		const char* newCrc = file2.data.findByPrefix("crc32[" + name + "]=", NULL);
 		if (newCrc != NULL) {
 			ScriptLibraryR.addStringToDataSection(newCrc);
 		}
@@ -2076,6 +2124,16 @@ bool updateCHL(const char* filename) {
 		} else {
 			int offset = ScriptLibraryR.addStringToDataSection(str.c_str());
 			TRACE("string added at %i: '%s'", offset, str.c_str());
+		}
+	}
+	if (stopAllInChangedFiles) {
+		for (auto name : diff.sources.removed) {
+			scriptsToStopFilename = name.c_str();
+			ScriptLibraryR.StopScripts(0, stopScriptsInFile);
+		}
+		for (auto name : diff.sources.changed) {
+			scriptsToStopFilename = name.c_str();
+			ScriptLibraryR.StopScripts(0, stopScriptsInFile);
 		}
 	}
 	//Remove deleted scripts (must be done before adding new global vars, otherwise may conflict)
@@ -2115,7 +2173,7 @@ bool updateCHL(const char* filename) {
 	DEBUG("removing %i global variables", diff.globalVars.removed.size());
 	for (auto name : diff.globalVars.removed) {
 		if (name.starts_with('_')) {
-			TRACE("variable '%s' retained");
+			TRACE("variable '%s' retained", name.c_str());
 		} else {
 			Var* var = getGlobalVar(name.c_str());
 			if (var == NULL) {
@@ -2142,7 +2200,7 @@ bool updateCHL(const char* filename) {
 			if (newSize < 1) {
 				ERR("invalid new size for variable '%s': %i", name.c_str(), newSize);
 			} else if (newSize <= oldSize) {
-				TRACE("no need to shrink variable '%s'");
+				TRACE("no need to shrink variable '%s'", name.c_str());
 			} else {
 				//TODO
 				debugger->onMessage(3, "increasing the size of global variables is not supported (%s)", name.c_str());
@@ -2410,7 +2468,7 @@ DWORD __cdecl ScriptLibraryR_doStartScript(Script* pScript) {
 }
 
 int __cdecl ScriptLibraryR_stopTask0(Task* pTask) {
-	//TRACE("ScriptLibraryR_stopTask0(%p)", pTask);
+	TRACE("ScriptLibraryR_stopTask0(%p)", pTask);
 	for (auto it = watches.begin(); it != watches.end(); it++) {
 		Watch* watch = (*it).second;
 		if (watch->task == pTask) {
@@ -2559,6 +2617,8 @@ void initScriptLibraryR() {
 			ScriptLibraryR.pTaskExists				= (FARPROC)(ScriptLibraryR.base + taskExistsOffset);
 			ScriptLibraryR.pReadTask				= (FARPROC)(ScriptLibraryR.base + readTaskOffset);
 			ScriptLibraryR.pLhvmCpuLoop				= (FARPROC)(ScriptLibraryR.base + lhvmCpuLoopOffset);
+			ScriptLibraryR.pAddReference			= (FARPROC)(ScriptLibraryR.base + addReferenceOffset);
+			ScriptLibraryR.pRemoveReference			= (FARPROC)(ScriptLibraryR.base + removeReferenceOffset);
 			ScriptLibraryR.pOpcode_24_CALL			= (FARPROC)(ScriptLibraryR.base + opcode_24_CALL_Offset);
 			ScriptLibraryR.pGetExceptionHandlersCount= (FARPROC)(ScriptLibraryR.base + getExceptionHandlersCountOffset);
 			ScriptLibraryR.pGetExceptionHandlerCurrentIp = (FARPROC)(ScriptLibraryR.base + getExceptionHandlerCurrentIpOffset);

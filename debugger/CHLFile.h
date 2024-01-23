@@ -317,11 +317,11 @@ public:
 		return -1;
 	}
 
-	const char* findByPrefix(const std::string prefix) {
+	const char* findByPrefix(const std::string prefix, const char* after) {
 		size_t offset = 0;
 		while (offset < size) {
 			std::string str = std::string(data + offset);
-			if (str.starts_with(prefix)) {
+			if (data + offset > after && str.starts_with(prefix)) {
 				return data + offset;
 			}
 			offset += str.length() + 1;
@@ -490,8 +490,12 @@ public:
 
 	std::list<int>& getStringInstructions() {
 		if (stringInstructions.empty()) {
-			const char* prop = data.findByPrefix("string_instructions=");
-			if (prop != NULL) {
+			const char* prop = data.findByPrefix("string_instructions=", 0);
+			if (prop == NULL) {
+				WARNING("property 'string_instructions' not found");
+			}
+			while (prop != NULL) {
+				const char* next = data.findByPrefix("string_instructions=", prop);
 				const char* p0 = strchr(prop, '=') + 1;
 				while (*p0 != 0) {
 					const char* p1 = strchr(p0, ',');
@@ -504,8 +508,7 @@ public:
 					if (*p1 == 0) break;
 					p0 = p1 + 1;
 				}
-			} else {
-				WARNING("property 'string_instructions' not found");
+				prop = next;
 			}
 		}
 		return stringInstructions;
@@ -812,69 +815,98 @@ bool UScript::operator==(UScript const& other) const {
 		int opcode = instr1.opcode;
 		DWORD mode = instr1.mode;
 		DWORD attr = opcode_attrs[opcode];
-		if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
-			int relDst1 = instr1.intVal - offset1;
-			int relDst2 = instr2.intVal - offset2;
-			if (relDst1 != relDst2) {
-				TRACE("instruction %i is a jump to a different offset", srcAddr);
-				return false;
-			}
-		} else if ((attr & OP_ATTR_SCRIPT) == OP_ATTR_SCRIPT) {
-			if (instr1.intVal < 0 || instr1.intVal >= (int)scripts1.size()) return false;
-			if (instr2.intVal < 0 || instr2.intVal >= (int)scripts2.size()) return false;
-			UScript& target1 = scripts1[instr1.intVal];
-			UScript& target2 = scripts2[instr2.intVal];
-			if (target1.name != target2.name) {
-				TRACE("instruction %i is a call to a different script ('%s' instead of '%s')", srcAddr, target2.name.c_str(), target1.name.c_str());
-				return false;
-			}
-		} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr1.datatype == DataTypes::DT_VAR)) {
-			const int id1 = instr1.datatype == DataTypes::DT_VAR ? (int)instr1.floatVal : instr1.intVal;
-			const int id2 = instr2.datatype == DataTypes::DT_VAR ? (int)instr2.floatVal : instr2.intVal;
-			std::string name1 = this->getVar(id1);
-			std::string name2 = other.getVar(id2);
-			if (name1 == "") {
-				ERR("invalid variable ID: %i", id1);
-				return false;
-			}
-			if (name2 == "") {
-				ERR("invalid variable ID: %i", id2);
-				return false;
-			}
-			if (name1 != name2) {
-				TRACE("instruction %i references a different variable ('%s' instead of '%s')", srcAddr, name2.c_str(), name1.c_str());
-				return false;
-			}
-		} else if (instr1.datatype == DataTypes::DT_INT) {
-			while (srcAddr > stringInstr) {
-				stringInstructionIt++;
-				stringInstr = stringInstructionIt != stringInstructionEnd ? *stringInstructionIt : 0x7FFFFFFF;
-				TRACE("next instruction to compare as string reference: %u", stringInstr);
-			}
-			if (srcAddr == stringInstr) {					//String references
-				TRACE("comparing instruction %u as string reference", srcAddr);
-				const char* str1 = this->chl->data.getString(instr1.intVal);
-				const char* str2 = other.chl->data.getString(instr2.intVal);
-				if (str1 == NULL) {
-					TRACE("  left operand isn't a valid string reference");
+		bool popNull = opcode == Opcodes::POP && instr1.intVal == 0;
+		if ((attr & OP_ATTR_ARG) == OP_ATTR_ARG && !popNull) {
+			if ((attr & OP_ATTR_IP) == OP_ATTR_IP) {
+				int relDst1 = instr1.intVal - offset1;
+				int relDst2 = instr2.intVal - offset2;
+				if (relDst1 != relDst2) {
+					TRACE("instruction %i is a jump to a different offset", srcAddr);
 					return false;
-				} else if (str2 == NULL) {
-					ERR("cannot find string '%s'", str2);
+				}
+			} else if ((attr & OP_ATTR_SCRIPT) == OP_ATTR_SCRIPT) {
+				if (instr1.intVal < 0 || instr1.intVal >= (int)scripts1.size()) return false;
+				if (instr2.intVal < 0 || instr2.intVal >= (int)scripts2.size()) return false;
+				UScript& target1 = scripts1[instr1.intVal];
+				UScript& target2 = scripts2[instr2.intVal];
+				if (target1.name != target2.name) {
+					TRACE("instruction %i is a call to a different script ('%s' instead of '%s')", srcAddr, target2.name.c_str(), target1.name.c_str());
 					return false;
-				} else {
-					if (strcmp(str1, str2) != 0) {
-						TRACE("  '%s' != '%s'", str1, str2);
+				}
+			} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr1.datatype == DataTypes::DT_VAR)) {
+				const int id1 = instr1.datatype == DataTypes::DT_VAR ? (int)instr1.floatVal : instr1.intVal;
+				const int id2 = instr2.datatype == DataTypes::DT_VAR ? (int)instr2.floatVal : instr2.intVal;
+				std::string name1 = this->getVar(id1);
+				std::string name2 = other.getVar(id2);
+				if (name1 == "") {
+					ERR("invalid variable ID: %i", id1);
+					return false;
+				}
+				if (name2 == "") {
+					ERR("invalid variable ID: %i", id2);
+					return false;
+				}
+				if (name1 != name2) {
+					TRACE("instruction %i references a different variable ('%s' instead of '%s')", srcAddr, name2.c_str(), name1.c_str());
+					return false;
+				}
+			} else if (instr1.datatype == DataTypes::DT_INT) {
+				while (srcAddr > stringInstr) {
+					stringInstructionIt++;
+					stringInstr = stringInstructionIt != stringInstructionEnd ? *stringInstructionIt : 0x7FFFFFFF;
+					TRACE("next instruction to compare as string reference: %u", stringInstr);
+				}
+				if (srcAddr == stringInstr) {					//String references
+					TRACE("comparing instruction %u as string reference", srcAddr);
+					const char* str1 = this->chl->data.getString(instr1.intVal);
+					const char* str2 = other.chl->data.getString(instr2.intVal);
+					if (str1 == NULL) {
+						TRACE("  left operand isn't a valid string reference");
+						return false;
+					} else if (str2 == NULL) {
+						ERR("cannot find string '%s'", str2);
 						return false;
 					} else {
-						TRACE("  '%s' == '%s'", str1, str2);
+						if (strcmp(str1, str2) != 0) {
+							TRACE("  '%s' != '%s'", str1, str2);
+							return false;
+						} else {
+							TRACE("  '%s' == '%s'", str1, str2);
+						}
 					}
+				} else if (instr1.intVal != instr2.intVal) {	//Enums
+					TRACE("instruction %i references a different constant ('%i' instead of '%i')", srcAddr, instr2.intVal, instr1.intVal);
+					return false;
 				}
-			} else if (instr1.intVal != instr2.intVal) {	//Enums
-				TRACE("instruction %i references a different constant ('%i' instead of '%i')", srcAddr, instr2.intVal, instr1.intVal);
-				return false;
+			} else {
+				Instruction* nInstr1 = it1 + 2;
+				Instruction* nInstr2 = it1 + 2;
+				if (nInstr1 < instructions1.pEnd && nInstr2 < instructions2.pEnd
+						&& nInstr1->opcode == Opcodes::REF_PUSH && nInstr1->mode == 2
+						&& nInstr2->opcode == Opcodes::REF_PUSH && nInstr2->mode == 2) {
+					int id1 = (int)it1->floatVal;
+					int id2 = (int)it2->floatVal;
+					std::string name1 = this->getVar(id1);
+					std::string name2 = other.getVar(id2);
+					if (name1 == "") {
+						ERR("invalid variable ID: %i", id1);
+						return false;
+					}
+					if (name2 == "") {
+						ERR("invalid variable ID: %i", id2);
+						return false;
+					}
+					if (name1 != name2) {
+						TRACE("instruction %i references a different variable ('%s' instead of '%s')", srcAddr, name2.c_str(), name1.c_str());
+						return false;
+					}
+				} else if (instr1.intVal != instr2.intVal) {	//This works for FLOAT and BOOL too
+					TRACE("instruction %i references a different value ('%f' instead of '%f')", srcAddr, instr2.floatVal, instr1.floatVal);
+					return false;
+				}
 			}
 		} else if (instr1.intVal != instr2.intVal) {		//This works for FLOAT and BOOL too
-			TRACE("instruction %i references a different value ('%f' instead of '%f')", srcAddr, instr2.floatVal, instr1.floatVal);
+			TRACE("instruction %i references a different value ('%i' instead of '%i')", srcAddr, instr2.intVal, instr1.intVal);
 			return false;
 		}
 		//
