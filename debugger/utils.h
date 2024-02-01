@@ -37,6 +37,7 @@ int splitArgs(char* str, char sep, char** dst, int limit);
 int getArgIndex(char** argv, int argc, const char* arg);
 bool getArgFlag(char** argv, int argc, const char* arg);
 char* getArgVal(char** argv, int argc, const char* arg);
+char* getArgValOrDefault(char** argv, int argc, const char* arg, const char* def);
 
 DWORD crc32(DWORD crc, char* buf, size_t len);
 bool crc32file(const char* filename, DWORD* outHash);

@@ -701,7 +701,7 @@ Var* getGlobalVar(const char* name) {
 	return NULL;
 }
 
-int declareGlobalVar(const char* name, size_t size) {
+int declareGlobalVar(const char* name, size_t size, float value) {
 	int id = getGlobalVarId(name, 0);
 	if (id >= 0) {
 		debugger->onMessage(3, "variable '%s' already exists", name);
@@ -719,13 +719,17 @@ int declareGlobalVar(const char* name, size_t size) {
 		ScriptLibraryR.setVarType(VAR_TYPE_ARRAY, id);
 		TRACE("global variable '%s[%i]' added", name, size);
 	}
+	Var* var = getGlobalVarById(id);
+	for (size_t i = 0; i < size; i++, var++) {
+		var->floatVal = value;
+	}
 	return id;
 }
 
-int getOrDeclareGlobalVar(const char* name, size_t size) {
+int getOrDeclareGlobalVar(const char* name, size_t size, float value) {
 	int id = getGlobalVarId(name, 0);
 	if (id < 0) {
-		id = declareGlobalVar(name, size);
+		id = declareGlobalVar(name, size, value);
 	}
 	return id;
 }
@@ -858,10 +862,10 @@ void onChlLoaded() {
 	gamePaused = false;
 	//
 	initVarTypes();
-	debugger_result_id = getOrDeclareGlobalVar("__debugger_result", 1);
-	debugger_result_x_id = getOrDeclareGlobalVar("__debugger_result_x", 1);
-	debugger_result_y_id = getOrDeclareGlobalVar("__debugger_result_y", 1);
-	debugger_result_z_id = getOrDeclareGlobalVar("__debugger_result_z", 1);
+	debugger_result_id = getOrDeclareGlobalVar("__debugger_result", 1, 0.0f);
+	debugger_result_x_id = getOrDeclareGlobalVar("__debugger_result_x", 1, 0.0f);
+	debugger_result_y_id = getOrDeclareGlobalVar("__debugger_result_y", 1, 0.0f);
+	debugger_result_z_id = getOrDeclareGlobalVar("__debugger_result_z", 1, 0.0f);
 	//
 	DEBUG("searching for source directories in CHL");
 	const char* source_dirs = findStringData("source_dirs=", NULL, true);
@@ -1251,6 +1255,7 @@ int parseCode(const char* code, const char* filename) {
 		strcat(tmpfile, filename);
 	}
 	TRACE("writing temporary script to %s", tmpfile);
+	parseTempFile = std::string(tmpfile);
 	FILE* tmpFile = fopen(tmpfile, "w");
 	if (!tmpFile) {
 		ERR("unable to open file %s for write", tmpfile);
@@ -2214,7 +2219,8 @@ bool updateCHL(const char* filename, bool stopAllInChangedFiles) {
 		size_t p = var.find('/');
 		std::string name = var.substr(0, p);
 		int size = atoi(var.c_str() + p + 1);
-		int newId = declareGlobalVar(name.c_str(), size);
+		float val = file2.initGlobals.get(name)->floatVal;
+		int newId = declareGlobalVar(name.c_str(), size, val);
 		if (newId < 0) {
 			debugger->onMessage(3, "failed to add global variable '%s'", name.c_str());
 			return false;

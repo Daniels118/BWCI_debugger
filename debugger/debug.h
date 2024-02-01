@@ -277,8 +277,8 @@ bool varIsLocal(Var* var, Task* task);
 bool varIsArray(Task* task, Var* var);
 int getVarSize(Task* task, Var* var);
 
-int getOrDeclareGlobalVar(const char* name, size_t size);
-int declareGlobalVar(const char* name, size_t size);
+int getOrDeclareGlobalVar(const char* name, size_t size, float value);
+int declareGlobalVar(const char* name, size_t size, float value);
 int addLocalVar(Task* task, const char* name, float value, size_t size);
 
 Task* getInnermostFrame(Task* task);

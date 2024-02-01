@@ -117,7 +117,7 @@ class Gdb : public Debugger {
 		}
 
 		void start() {
-			shell_exitcode_id = getOrDeclareGlobalVar("_shell_exitcode", 1);
+			shell_exitcode_id = getOrDeclareGlobalVar("_shell_exitcode", 1, 0.0);
 		}
 
 		void threadStarted(Task* thread) {
@@ -2515,7 +2515,7 @@ class Gdb : public Debugger {
 					} else {
 						var = getVar(currentFrame, name);
 						if (var == NULL && name[0] == '_') {
-							int gVarId = declareGlobalVar(name, 1);
+							int gVarId = declareGlobalVar(name, 1, 0.0);
 							printf("Global variable '%s' defined with ID %i\n", name, gVarId);
 						}
 					}
@@ -2769,14 +2769,21 @@ class Gdb : public Debugger {
 		}
 
 		static bool c_updateChl(char* rawBuffer, int argc, const char* cmd) {
-			bool all = getArgFlag(argv, argc, "-all");
 			const char* filename = getArgVal(argv, argc, "-f");
+			char* stopMode = getArgValOrDefault(argv, argc, "-stop", "script");
+			char* restart = getArgVal(argv, argc, "-r");
+			bool stopAllInChangedFiles = streq(stopMode, "file");
 			captureKilledThreads = true;
-			if (updateCHL(filename, all)) {
+			if (updateCHL(filename, stopAllInChangedFiles)) {
 				if (!killedThreads.empty()) {
 					int r = 0;
 					while (r == 0) {
-						prompt("Do you want to restart previous threads? (yes/no/all) ");
+						if (restart == NULL) {
+							prompt("Do you want to restart previous threads? (yes/no/all) ");
+						} else {
+							strcpy(buffer, restart);
+							restart = NULL;
+						}
 						if (abbrev(buffer, "yes", 1)) {
 							r = 1;
 						} else if (abbrev(buffer, "no", 1)) {

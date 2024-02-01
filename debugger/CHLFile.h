@@ -430,6 +430,15 @@ public:
 		}
 		return true;
 	}
+
+	InitGlobal* get(std::string name) {
+		for (auto& var : items) {
+			if (var.name == name) {
+				return &var;
+			}
+		}
+		return NULL;
+	}
 };
 
 class CHLFile {

@@ -203,8 +203,12 @@ bool getArgFlag(char** argv, int argc, const char* arg) {
 }
 
 char* getArgVal(char** argv, int argc, const char* arg) {
+    return getArgValOrDefault(argv, argc, arg, NULL);
+}
+
+char* getArgValOrDefault(char** argv, int argc, const char* arg, const char* def) {
     int index = getArgIndex(argv, argc, arg);
-    if (index < 0 || index >= argc - 1) return NULL;
+    if (index < 0 || index >= argc - 1) return (char*)def;
     return argv[index + 1];
 }
 
