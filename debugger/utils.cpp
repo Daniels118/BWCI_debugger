@@ -139,6 +139,21 @@ std::string strReplace(const std::string haystack, std::string needle, std::stri
     return str;
 }
 
+bool strin(const char* str, ...) {
+    va_list args;
+    va_start(args, str);
+    int count = va_arg(args, int);
+    bool res = false;
+    for (int i = 0; i < count; ++i) {
+        if (streq(str, (char*)va_arg(args, int))) {
+            res = true;
+            break;
+        }
+    }
+    va_end(args);
+    return res;
+}
+
 int rejoinArgsC(char** argv, int argc, int startIndex, int count) {
     for (int i = startIndex + 1; i < MIN(startIndex + count, argc); i++) {
         char* arg = argv[i];

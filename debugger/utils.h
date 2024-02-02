@@ -28,6 +28,7 @@ bool isNumber(const std::string& str);
 
 const char* ltrim(const char* str);
 std::string strReplace(const std::string haystack, std::string needle, std::string replacement);
+bool strin(const char* str, ...);
 
 int rejoinArgsC(char** argv, int argc, int startIndex, int count);
 int rejoinArgs(char** argv, int argc, const char* startArg, const char* endArg);

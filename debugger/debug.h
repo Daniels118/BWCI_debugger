@@ -294,6 +294,7 @@ Task* getTaskById(int taskId);
 void setSource(std::string filename, std::vector<std::string> lines);
 void unsetSource(std::string filename);
 void unsetMissingSources();
+std::string findSourceFile(std::string filename);
 std::vector<std::string> getSource(std::string filename);
 std::string getSourceLine(std::string filename, int lineno);
 std::string getCurrentSourceLine(Task* task);

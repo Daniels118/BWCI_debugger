@@ -4,6 +4,7 @@
 #include "CHLFile.h"
 #include "debug.h"
 #include "gdb.h"
+#include "xdebug.h"
 
 #include <iostream>
 
@@ -211,26 +212,31 @@ void unsetMissingSources() {
 	}
 }
 
-std::vector<std::string> getSource(std::string filename) {
-	if (!sources.contains(filename)) {
-		TRACE("searching for %s", filename.c_str());
-		bool found = false;
-		for (std::string path : sourcePath) {
-			TRACE("\tsearching in %s", path.c_str());
-			for (const auto& entry : std::filesystem::directory_iterator(path)) {
-				TRACE("\t\t%s", entry.path().filename().string().c_str());
-				if (entry.path().filename().string() == filename) {
-					if (checkFileHash(filename, entry.path().string()) >= 0) {
-						DEBUG("file found.");
-						sources[filename] = readFile(entry.path());
-						found = true;
-						break;
-					}
+std::string findSourceFile(std::string filename) {
+	TRACE("searching for %s", filename.c_str());
+	bool found = false;
+	for (std::string path : sourcePath) {
+		TRACE("\tsearching in %s", path.c_str());
+		for (const auto& entry : std::filesystem::directory_iterator(path)) {
+			TRACE("\t\t%s", entry.path().filename().string().c_str());
+			if (entry.path().filename().string() == filename) {
+				if (checkFileHash(filename, entry.path().string()) >= 0) {
+					DEBUG("file found.");
+					return entry.path().string();
 				}
 			}
-			if (found) break;
 		}
-		if (!found) {
+	}
+	return "";
+}
+
+std::vector<std::string> getSource(std::string filename) {
+	if (!sources.contains(filename)) {
+		std::string absfile = findSourceFile(filename);
+		if (absfile != "") {
+			auto filepath = std::filesystem::path(absfile);
+			sources[filename] = readFile(filepath);
+		} else {
 			sources[filename] = std::vector<std::string>();
 			debugger->onMessage(3, "File %s not found.", filename.c_str());
 		}
@@ -2772,7 +2778,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			if (debugging) {
 				if (useXDebug) {
 					#ifdef DEBUGGER_XDEBUG
-
+						debugger = new XDebug();
 					#else
 						ERR("xdebug is not supported");
 					#endif
