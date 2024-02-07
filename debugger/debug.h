@@ -191,6 +191,7 @@ class Breakpoint {
 		bool triggerPoint = false;
 		bool disabledByTrigger = false;
 		bool deleteOnHit = false;
+		bool temporary = false;
 		Task* thread = NULL;
 
 		std::list<std::string> commands;
@@ -240,6 +241,12 @@ class Breakpoint {
 
 typedef std::list<std::pair<DWORD, std::string>> ParserMessages;
 
+int getObjectType(DWORD objId);
+int getObjectSubType(DWORD objId);
+const char* getTypeName(int type);
+const char* getSubTypeName(int type, int subType);
+void getObjectPosition(DWORD objId, float coords[]);
+
 const char* findFilenameByIp(DWORD ip);
 
 const char* findStringData(std::string needle, const char* after, bool prefix);
@@ -282,12 +289,14 @@ int declareGlobalVar(const char* name, size_t size, float value);
 int addLocalVar(Task* task, const char* name, float value, size_t size);
 
 Task* getInnermostFrame(Task* task);
+Task* getFrameAt(Task* task, int depth);
 int getFrameDepth(Task* task);
 std::vector<Task*> getBacktrace(Task* task);
 Task* getParentFrame(Task* frame);
+Task* getParentFrame(Task* task, int depth);
 Task* getChildFrame(Task* frame);
+Task* getChildFrame(Task* task, int depth);
 std::vector<Task*> getThreads();
-Task* getFrame(Task* thread);
 Task* getThread(Task* task);
 Task* getTaskById(int taskId);
 
@@ -322,6 +331,7 @@ Breakpoint* getBreakpointAtAddress(int ip);
 std::list<Watch*> getWatches();
 Watch* addWatch(Task* task, const char* expression);
 Watch* getWatchByIndex(DWORD index);
+Watch* getWatchByExpression(Task* task, std::string expr);
 bool deleteWatch(Watch* watch);
 
 void jump(Task* task, int ip);

@@ -1,3 +1,5 @@
+#define WIN32_LEAN_AND_MEAN
+
 #include "dllmain.h"
 #include "bwfuncs.h"
 #include "ScriptLibraryR.h"
@@ -37,6 +39,7 @@ char chlFilename[MAX_PATH];
 
 char gamePath[MAX_PATH];
 std::set<std::string> sourcePath;
+std::unordered_map<std::string, std::string> sourceFiles;
 std::unordered_map<std::string, std::vector<std::string>> sources;
 std::map<int, Breakpoint*> breakpoints;
 std::map<std::string, Watch*> watches;
@@ -53,6 +56,7 @@ bool pause = false;
 
 Debugger* debugger;
 bool debugging = false;
+bool initCalled = false;
 
 std::map<int, Script*> scripts;
 std::map<std::string, Script*> scriptsByName;
@@ -74,14 +78,14 @@ std::string parseTempFile = "";
 int allowedThreadId = 0;
 
 int debugger_result_id;
-int debugger_result_x_id;
-int debugger_result_y_id;
-int debugger_result_z_id;
+int debugger_result_coord_id;
 
 bool gamePaused = false;
 
 const char* scriptsToStopFilename = NULL;
 
+std::unordered_map<int, const char*> rScriptObjectTypes;
+std::unordered_map<int, std::unordered_map<int, const char*>> rScriptObjectSubtypes;
 
 int __cdecl errorCallback(DWORD severity, const char* msg);
 int getScriptSize(Script* script);
@@ -97,14 +101,14 @@ void Fail(const char* a) {
 
 const char* detourErrorCode(LONG err) {
 	switch (err) {
-		case ERROR_INVALID_BLOCK:
-			return "ERROR_INVALID_BLOCK";
-		case ERROR_INVALID_HANDLE:
-			return "ERROR_INVALID_HANDLE";
-		case ERROR_INVALID_OPERATION:
-			return "ERROR_INVALID_OPERATION";
-		case ERROR_NOT_ENOUGH_MEMORY:
-			return "ERROR_NOT_ENOUGH_MEMORY";
+	case ERROR_INVALID_BLOCK:
+		return "ERROR_INVALID_BLOCK";
+	case ERROR_INVALID_HANDLE:
+		return "ERROR_INVALID_HANDLE";
+	case ERROR_INVALID_OPERATION:
+		return "ERROR_INVALID_OPERATION";
+	case ERROR_NOT_ENOUGH_MEMORY:
+		return "ERROR_NOT_ENOUGH_MEMORY";
 	}
 	return "unknown";
 }
@@ -126,6 +130,49 @@ LONG detour(PVOID* ppPointer, PVOID pDetour, const char* name) {
 }
 
 #define DETOUR(NAME, WRAPPER) detour((PVOID*)(&NAME), (PVOID)WRAPPER, #NAME)
+
+void callNativeFunction(NativeFunctions id) {
+	(*ScriptLibraryR.ppNativeFunctions)[id].pointer();
+}
+
+int getObjectType(DWORD objId) {
+	ScriptLibraryR.PUSHU(objId, DataTypes::DT_OBJECT);
+	callNativeFunction(NativeFunctions::GAME_TYPE);
+	return ScriptLibraryR.POPI(NULL);
+}
+
+int getObjectSubType(DWORD objId) {
+	ScriptLibraryR.PUSHU(objId, DataTypes::DT_OBJECT);
+	callNativeFunction(NativeFunctions::GAME_SUB_TYPE);
+	return ScriptLibraryR.POPI(NULL);
+}
+
+const char* getTypeName(int type) {
+	if (rScriptObjectTypes.contains(type)) {
+		return rScriptObjectTypes[type];
+	}
+	return "UNKNOWN";
+}
+
+const char* getSubTypeName(int type, int subType) {
+	if (subType == 9999) return "";
+	if (rScriptObjectSubtypes.contains(type)) {
+		auto& rSubtypes = rScriptObjectSubtypes[type];
+		if (rSubtypes.contains(subType)) {
+			return rSubtypes[subType];
+		}
+	}
+	return "UNKNOWN";
+}
+
+void getObjectPosition(DWORD objId, float coords[]) {
+	ScriptLibraryR.PUSHU(objId, DataTypes::DT_OBJECT);
+	callNativeFunction(NativeFunctions::GET_POSITION);
+	for (int i = 2, j = (*ScriptLibraryR.ppCurrentStack)->count - 1; i >= 0; i--, j--) {
+		coords[i] = (*ScriptLibraryR.ppCurrentStack)->floatVals[j];
+		ScriptLibraryR.POP(NULL);	//For some reason this always returns zero
+	}
+}
 
 void jump(Task* task, int ip) {
 	task->ip = ip;
@@ -188,7 +235,7 @@ int checkFileHash(std::string storedFilename, std::string sourceFilename) {
 	}
 	if (storedHash != fileHash) {
 		debugger->onMessage(3, "File %s doesn't match with the stored hash (computed: %08X, found: %08X).",
-				sourceFilename.c_str(), fileHash, storedHash);
+			sourceFilename.c_str(), fileHash, storedHash);
 		return -2;
 	}
 	return 0;
@@ -199,10 +246,18 @@ void setSource(std::string filename, std::vector<std::string> lines) {
 }
 
 void unsetSource(std::string filename) {
+	sourceFiles.erase(filename);
 	sources.erase(filename);
 }
 
 void unsetMissingSources() {
+	for (auto it = sourceFiles.cbegin(); it != sourceFiles.cend(); ) {
+		if ((*it).second.empty()) {
+			sourceFiles.erase(it++);
+		} else {
+			++it;
+		}
+	}
 	for (auto it = sources.cbegin(); it != sources.cend(); ) {
 		if ((*it).second.empty()) {
 			sources.erase(it++);
@@ -213,21 +268,27 @@ void unsetMissingSources() {
 }
 
 std::string findSourceFile(std::string filename) {
-	TRACE("searching for %s", filename.c_str());
-	bool found = false;
-	for (std::string path : sourcePath) {
-		TRACE("\tsearching in %s", path.c_str());
-		for (const auto& entry : std::filesystem::directory_iterator(path)) {
-			TRACE("\t\t%s", entry.path().filename().string().c_str());
-			if (entry.path().filename().string() == filename) {
-				if (checkFileHash(filename, entry.path().string()) >= 0) {
-					DEBUG("file found.");
-					return entry.path().string();
+	if (!sourceFiles.contains(filename)) {
+		TRACE("searching for %s", filename.c_str());
+		bool found = false;
+		for (std::string path : sourcePath) {
+			TRACE("\tsearching in %s", path.c_str());
+			for (const auto& entry : std::filesystem::directory_iterator(path)) {
+				TRACE("\t\t%s", entry.path().filename().string().c_str());
+				if (entry.path().filename().string() == filename) {
+					if (checkFileHash(filename, entry.path().string()) >= 0) {
+						DEBUG("file found.");
+						sourceFiles[filename] = entry.path().string();
+						found = true;
+					}
 				}
 			}
 		}
+		if (!found) {
+			sourceFiles[filename] = "";
+		}
 	}
-	return "";
+	return sourceFiles[filename];
 }
 
 std::vector<std::string> getSource(std::string filename) {
@@ -397,7 +458,7 @@ void formatInstruction(Script* script, Instruction* instr, char* buffer) {
 	if (hasArg && !popNull && !swapZero || isZero) {
 		strcat(buffer, " ");
 		if (opcode == SYS) {
-			const char* name = NativeFunctions[intVal];
+			const char* name = NativeFunctionNames[intVal];
 			strcat(buffer, name);
 		} else if (opcode == CALL) {
 			Script* script = getScriptById(intVal);
@@ -422,18 +483,18 @@ void formatInstruction(Script* script, Instruction* instr, char* buffer) {
 			_itoa(intVal, &buffer[strlen(buffer)], 10);
 		} else {
 			switch (instr->datatype) {
-				case DT_FLOAT:
-					sprintf(&buffer[strlen(buffer)], "%f", instr->floatVal);
-					break;
-				case DT_BOOLEAN:
-					strcat(buffer, intVal ? "true" : "false");
-					break;
-				case DT_VAR:
-					intVal = (int)instr->floatVal;
-					formatVar(script, intVal, buffer + strlen(buffer));
-					break;
-				default:
-					_itoa(intVal, &buffer[strlen(buffer)], 10);
+			case DT_FLOAT:
+				sprintf(&buffer[strlen(buffer)], "%f", instr->floatVal);
+				break;
+			case DT_BOOLEAN:
+				strcat(buffer, intVal ? "true" : "false");
+				break;
+			case DT_VAR:
+				intVal = (int)instr->floatVal;
+				formatVar(script, intVal, buffer + strlen(buffer));
+				break;
+			default:
+				_itoa(intVal, &buffer[strlen(buffer)], 10);
 			}
 		}
 	}
@@ -452,7 +513,7 @@ void formatTaskInstruction(Task* task, Instruction* instr, char* buffer) {
 	if (hasArg && !popNull && !swapZero || isZero) {
 		strcat(buffer, " ");
 		if (opcode == SYS) {
-			const char* name = NativeFunctions[intVal];
+			const char* name = NativeFunctionNames[intVal];
 			strcat(buffer, name);
 		} else if (isRef) {
 			if (instr->datatype == DT_VAR) {
@@ -469,18 +530,18 @@ void formatTaskInstruction(Task* task, Instruction* instr, char* buffer) {
 			_itoa(intVal, &buffer[strlen(buffer)], 10);
 		} else {
 			switch (instr->datatype) {
-				case DT_FLOAT:
-					sprintf(&buffer[strlen(buffer)], "%f", instr->floatVal);
-					break;
-				case DT_BOOLEAN:
-					strcat(buffer, intVal ? "true" : "false");
-					break;
-				case DT_VAR:
-					intVal = (int)instr->floatVal;
-					formatTaskVar(task, intVal, &buffer[strlen(buffer)]);
-					break;
-				default:
-					_itoa(intVal, &buffer[strlen(buffer)], 10);
+			case DT_FLOAT:
+				sprintf(&buffer[strlen(buffer)], "%f", instr->floatVal);
+				break;
+			case DT_BOOLEAN:
+				strcat(buffer, intVal ? "true" : "false");
+				break;
+			case DT_VAR:
+				intVal = (int)instr->floatVal;
+				formatTaskVar(task, intVal, &buffer[strlen(buffer)]);
+				break;
+			default:
+				_itoa(intVal, &buffer[strlen(buffer)], 10);
 			}
 		}
 	}
@@ -774,10 +835,29 @@ Task* getParentFrame(Task* frame) {
 	return tasksParents[frame->taskNumber];
 }
 
+Task* getParentFrame(Task* task, int depth) {
+	for (; task != NULL && depth > 0; depth--) {
+		task = getParentFrame(task);
+	}
+	return task;
+}
+
 Task* getChildFrame(Task* frame) {
 	if (frame == NULL) return NULL;
 	if (frame->waitingTask == 0) return NULL;
 	return getTaskById(frame->waitingTask);
+}
+
+Task* getChildFrame(Task* task, int depth) {
+	for (; task != NULL && depth > 0; depth--) {
+		task = getChildFrame(task);
+	}
+	return task;
+}
+
+Task* getFrameAt(Task* task, int depth) {
+	task = getInnermostFrame(task);
+	return getParentFrame(task, depth);
 }
 
 std::vector<Task*> getThreads() {
@@ -787,20 +867,6 @@ std::vector<Task*> getThreads() {
 		res.push_back(entry.second);
 	}
 	return res;
-}
-
-Task* getFrame(Task* thread) {
-	if (thread->waitingTask) {
-		std::map<int, Task*> tasksMap;
-		for (TaskEntry* taskEntry = ScriptLibraryR.pTaskList->pFirst; taskEntry != NULL; taskEntry = taskEntry->next) {
-			Task* t = taskEntry->task;
-			tasksMap[t->taskNumber] = t;
-		}
-		while (thread->waitingTask) {
-			thread = tasksMap[thread->waitingTask];
-		}
-	}
-	return thread;
 }
 
 Task* getThread(Task* task) {
@@ -849,6 +915,7 @@ void initVarTypes() {
 
 void cleanup() {
 	DEBUG("cleanup");
+	sourceFiles.clear();
 	sources.clear();
 	scripts.clear();
 	scriptsByName.clear();
@@ -869,9 +936,7 @@ void onChlLoaded() {
 	//
 	initVarTypes();
 	debugger_result_id = getOrDeclareGlobalVar("__debugger_result", 1, 0.0f);
-	debugger_result_x_id = getOrDeclareGlobalVar("__debugger_result_x", 1, 0.0f);
-	debugger_result_y_id = getOrDeclareGlobalVar("__debugger_result_y", 1, 0.0f);
-	debugger_result_z_id = getOrDeclareGlobalVar("__debugger_result_z", 1, 0.0f);
+	debugger_result_coord_id = getOrDeclareGlobalVar("__debugger_result_coord", 3, 0.0f);
 	//
 	DEBUG("searching for source directories in CHL");
 	const char* source_dirs = findStringData("source_dirs=", NULL, true);
@@ -888,6 +953,10 @@ void onChlLoaded() {
 		}
 	}
 	//
+	if (!initCalled) {
+		initCalled = true;
+		debugger->init();
+	}
 	debugger->start();
 }
 
@@ -967,7 +1036,7 @@ void debugger_execute_pre(Task* task) {
 				breakpoint->hits++;
 				if (breakpoint->targetHitCount == 0 || breakpoint->targetHitCount == breakpoint->hits) {
 					lastBreakLine = instruction->linenumber;
-					if (breakpoint->targetHitCount) {
+					if (breakpoint->temporary || breakpoint->targetHitCount) {
 						breakpoint->setEnabled(false);
 					}
 					debugger->breakpointHit(task, breakpoint);
@@ -986,7 +1055,7 @@ void debugger_execute_pre(Task* task) {
 			}
 		}
 	} else if (breakAfterInstructions > 0 && (steppingThread == NULL || getThread(task) == steppingThread)
-			&& (!task->inExceptionHandler || tasksInfo[task->taskNumber]->exceptionMatched)) {
+		&& (!task->inExceptionHandler || tasksInfo[task->taskNumber]->exceptionMatched)) {
 		if (getFrameDepth(task) <= stepInMaxDepth) {
 			if (--breakAfterInstructions == 0) {
 				lastBreakLine = instruction->linenumber;
@@ -1008,7 +1077,7 @@ void debugger_execute_pre(Task* task) {
 			}
 		}
 	} else if (instruction->opcode == Opcodes::SYS
-			&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal] == ENABLED) {
+		&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal] == ENABLED) {
 		debugger->onCatchpoint(task, EV_SYSCALL);
 	} else if (instruction->opcode == Opcodes::CALL && catchRunScripts.contains(getScriptById(instruction->intVal)->name)) {
 		debugger->onCatchpoint(task, EV_RUN);
@@ -1269,10 +1338,10 @@ int parseCode(const char* code, const char* filename) {
 	}
 	fwrite(code, 1, strlen(code), tmpFile);
 	fclose(tmpFile);
-	#if LOG_LEVEL >= LL_DEEP_TRACE
-		*ScriptLibraryR.pParserTraceEnabled = 1;
-	#endif
-	*ScriptLibraryR.pErrorsCount = 0;
+#if LOG_LEVEL >= LL_DEEP_TRACE
+	* ScriptLibraryR.pParserTraceEnabled = 1;
+#endif
+	* ScriptLibraryR.pErrorsCount = 0;
 	const int prevInstructionsCount = getTotalInstructions();
 	DEBUG("compiling code");
 	int r = ScriptLibraryR.ParseFile(NULL, tmpfile, gamePath);
@@ -1393,51 +1462,51 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	TRACE("building the code");
 	const char* codeTemplate;
 	switch (datatype) {
-		case DT_FLOAT:
-			codeTemplate =
-				"begin script %1$s\n"
-				"%2$s"
-				"start\n"
-				"%3$s"
-				"	__debugger_result = %4$s\n"
-				"end script %1$s";
-			break;
-		case DT_INT:
-			codeTemplate =
-				"begin script %1$s\n"
-				"%2$s"
-				"start\n"
-				"%3$s"
-				"	__debugger_result = variable %4$s\n"
-				"end script %1$s";
-			break;
-		case DT_BOOLEAN:
-			codeTemplate =
-				"begin script %1$s\n"
-				"%2$s"
-				"start\n"
-				"%3$s"
-				"	__debugger_result = 0\n"
-				"	if %4$s\n"
-				"		__debugger_result = 1\n"
-				"	end if\n"
-				"end script %1$s";
-			break;
-		case DT_COORDS:
-			codeTemplate =
-				"begin script %1$s\n"
-				"%2$s"
-				"start\n"
-				"%3$s"
-				"	__debugger_result = marker at (%4$s)\n"
-				"	__debugger_result_x = SCRIPT_OBJECT_PROPERTY_TYPE_XPOS of __debugger_result\n"
-				"	__debugger_result_y = SCRIPT_OBJECT_PROPERTY_TYPE_YPOS of __debugger_result\n"
-				"	__debugger_result_z = SCRIPT_OBJECT_PROPERTY_TYPE_ZPOS of __debugger_result\n"
-				"end script %1$s";
-			break;
-		default:
-			debugger->onMessage(3, "unsupported datatype");
-			return NULL;
+	case DT_FLOAT:
+		codeTemplate =
+			"begin script %1$s\n"
+			"%2$s"
+			"start\n"
+			"%3$s"
+			"	__debugger_result = %4$s\n"
+			"end script %1$s";
+		break;
+	case DT_INT:
+		codeTemplate =
+			"begin script %1$s\n"
+			"%2$s"
+			"start\n"
+			"%3$s"
+			"	__debugger_result = variable %4$s\n"
+			"end script %1$s";
+		break;
+	case DT_BOOLEAN:
+		codeTemplate =
+			"begin script %1$s\n"
+			"%2$s"
+			"start\n"
+			"%3$s"
+			"	__debugger_result = 0\n"
+			"	if %4$s\n"
+			"		__debugger_result = 1\n"
+			"	end if\n"
+			"end script %1$s";
+		break;
+	case DT_COORDS:
+		codeTemplate =
+			"begin script %1$s\n"
+			"%2$s"
+			"start\n"
+			"%3$s"
+			"	__debugger_result = marker at (%4$s)\n"
+			"	__debugger_result_coord[0] = SCRIPT_OBJECT_PROPERTY_TYPE_XPOS of __debugger_result\n"
+			"	__debugger_result_coord[1] = SCRIPT_OBJECT_PROPERTY_TYPE_YPOS of __debugger_result\n"
+			"	__debugger_result_coord[2] = SCRIPT_OBJECT_PROPERTY_TYPE_ZPOS of __debugger_result\n"
+			"end script %1$s";
+		break;
+	default:
+		debugger->onMessage(3, "unsupported datatype");
+		return NULL;
 	}
 	const int bytes = strlen(codeTemplate) + 2 * strlen(scriptName) + strlen(localDecl) + init.length() + rExpression.length() + 1;
 	char* code = (char*)malloc(bytes);
@@ -1500,7 +1569,7 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 	(*ScriptLibraryR.pHighestScriptId)--;
 	deleteScript0(newScript, false);	//... without deleting the code
 	//
-	#if LOG_LEVEL >= LL_TRACE
+#if LOG_LEVEL >= LL_TRACE
 	char buffer[80];
 	TRACE("compiled code:");
 	for (int i = instructionAddress; ; i++) {
@@ -1509,7 +1578,7 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 		printf("%i: %s\n", i, buffer);
 		if (instr->opcode == END) break;
 	}
-	#endif
+#endif
 	//
 	Expression* expr = new Expression(sExpression, datatype, script, globalsCount, start, size, instructionAddress);
 	unusedExpressionsSize += expr->getSize();
@@ -1637,10 +1706,10 @@ void collectGarbage() {
 	}
 	if (shrink) {
 		const int currentSize = getTotalInstructions();
-		#if LOG_LEVEL >= LL_TRACE
-			memoryManager.printSegments();
-			printf("Total: %i\n", currentSize);
-		#endif
+#if LOG_LEVEL >= LL_TRACE
+		memoryManager.printSegments();
+		printf("Total: %i\n", currentSize);
+#endif
 		const int newSize = memoryManager.setTotalSize(currentSize);
 		if (newSize < currentSize) {
 			DEBUG("shrinking code array from %i to %i instructions", currentSize, newSize);
@@ -1718,7 +1787,7 @@ Var* evalExpression(Task* context, Expression* expr) {
 	//
 	Var* result;
 	if (expr->datatype == DT_COORDS) {
-		result = getVarById(NULL, debugger_result_x_id);
+		result = getVarById(NULL, debugger_result_coord_id);
 	} else {
 		result = getVarById(NULL, debugger_result_id);
 	}
@@ -1749,11 +1818,11 @@ Var* evalExpression(Task* context, Expression* expr) {
 	currentTask = &evalTask;
 	while (!evalTask.stop) {
 		Instruction& instruction = ScriptLibraryR.instructions->pFirst[evalTask.ip];
-		#if LOG_LEVEL >= LL_TRACE
-			char buffer[80];
-			formatTaskInstruction(&evalTask, &instruction, buffer);
-			TRACE("eval: %i: %s", evalTask.ip, buffer);
-		#endif
+#if LOG_LEVEL >= LL_TRACE
+		char buffer[80];
+		formatTaskInstruction(&evalTask, &instruction, buffer);
+		TRACE("eval: %i: %s", evalTask.ip, buffer);
+#endif
 		OpcodeImpl opcodeImpl = ScriptLibraryR.opcodesImpl[instruction.opcode];
 		opcodeImpl(currentTask, &instruction);
 		++evalTask.ip;
@@ -2446,6 +2515,15 @@ Watch* getWatchByIndex(DWORD index) {
 	}
 }
 
+Watch* getWatchByExpression(Task* task, std::string expr) {
+	std::string key = "{" + (task == NULL ? std::string("0") : std::to_string(task->taskNumber)) + "} " + expr;
+	if (watches.contains(key)) {
+		return watches[key];
+	} else {
+		return NULL;
+	}
+}
+
 bool deleteWatch(Watch* watch) {
 	if (watches.contains(watch->getKey())) {
 		watches.erase(watch->getKey());
@@ -2594,7 +2672,11 @@ void initScriptLibraryR() {
 		ScriptLibraryR.pOpCode = GetProcAddress(ScriptLibraryR.hmod, "OpCode");
 		ScriptLibraryR.pOpCodeName = GetProcAddress(ScriptLibraryR.hmod, "OpCodeName");
 		ScriptLibraryR.pPOP = GetProcAddress(ScriptLibraryR.hmod, "POP");
+		ScriptLibraryR.pPOPI = ScriptLibraryR.pPOP;
+		ScriptLibraryR.pPOPU = ScriptLibraryR.pPOP;
 		ScriptLibraryR.pPUSH = GetProcAddress(ScriptLibraryR.hmod, "PUSH");
+		ScriptLibraryR.pPUSHI = ScriptLibraryR.pPUSH;
+		ScriptLibraryR.pPUSHU = ScriptLibraryR.pPUSH;
 		ScriptLibraryR.pParseFile = GetProcAddress(ScriptLibraryR.hmod, "ParseFile");
 		ScriptLibraryR.pParsedFile = GetProcAddress(ScriptLibraryR.hmod, "ParsedFile");
 		ScriptLibraryR.pReboot = GetProcAddress(ScriptLibraryR.hmod, "Reboot");
@@ -2618,59 +2700,94 @@ void initScriptLibraryR() {
 		int version = ScriptLibraryR.Version();
 		if (version == 8) {
 			//Internal functions
-			ScriptLibraryR.pLoadGameHeaders			= (FARPROC)(ScriptLibraryR.base + loadGameHeadersOffset);
-			ScriptLibraryR.pCreateArray				= (FARPROC)(ScriptLibraryR.base + createArrayOffset);
-			ScriptLibraryR.pGetVarType				= (FARPROC)(ScriptLibraryR.base + getVarTypeOffset);
-			ScriptLibraryR.pSetVarType				= (FARPROC)(ScriptLibraryR.base + setVarTypeOffset);
-			ScriptLibraryR.pCreateVar				= (FARPROC)(ScriptLibraryR.base + createVarOffset);
-			ScriptLibraryR.pAddStringToDataSection	= (FARPROC)(ScriptLibraryR.base + addStringToDataSectionOffset);
-			ScriptLibraryR.pDoStartScript			= (FARPROC)(ScriptLibraryR.base + doStartScriptOffset);
-			ScriptLibraryR.pStopTask0				= (FARPROC)(ScriptLibraryR.base + stopTask0Offset);
-			ScriptLibraryR.pTaskExists				= (FARPROC)(ScriptLibraryR.base + taskExistsOffset);
-			ScriptLibraryR.pReadTask				= (FARPROC)(ScriptLibraryR.base + readTaskOffset);
-			ScriptLibraryR.pLhvmCpuLoop				= (FARPROC)(ScriptLibraryR.base + lhvmCpuLoopOffset);
-			ScriptLibraryR.pAddReference			= (FARPROC)(ScriptLibraryR.base + addReferenceOffset);
-			ScriptLibraryR.pRemoveReference			= (FARPROC)(ScriptLibraryR.base + removeReferenceOffset);
-			ScriptLibraryR.pOpcode_24_CALL			= (FARPROC)(ScriptLibraryR.base + opcode_24_CALL_Offset);
-			ScriptLibraryR.pGetExceptionHandlersCount= (FARPROC)(ScriptLibraryR.base + getExceptionHandlersCountOffset);
+			ScriptLibraryR.pLoadGameHeaders = (FARPROC)(ScriptLibraryR.base + loadGameHeadersOffset);
+			ScriptLibraryR.pCreateArray = (FARPROC)(ScriptLibraryR.base + createArrayOffset);
+			ScriptLibraryR.pGetVarType = (FARPROC)(ScriptLibraryR.base + getVarTypeOffset);
+			ScriptLibraryR.pSetVarType = (FARPROC)(ScriptLibraryR.base + setVarTypeOffset);
+			ScriptLibraryR.pCreateVar = (FARPROC)(ScriptLibraryR.base + createVarOffset);
+			ScriptLibraryR.pAddStringToDataSection = (FARPROC)(ScriptLibraryR.base + addStringToDataSectionOffset);
+			ScriptLibraryR.pDoStartScript = (FARPROC)(ScriptLibraryR.base + doStartScriptOffset);
+			ScriptLibraryR.pStopTask0 = (FARPROC)(ScriptLibraryR.base + stopTask0Offset);
+			ScriptLibraryR.pTaskExists = (FARPROC)(ScriptLibraryR.base + taskExistsOffset);
+			ScriptLibraryR.pReadTask = (FARPROC)(ScriptLibraryR.base + readTaskOffset);
+			ScriptLibraryR.pLhvmCpuLoop = (FARPROC)(ScriptLibraryR.base + lhvmCpuLoopOffset);
+			ScriptLibraryR.pAddReference = (FARPROC)(ScriptLibraryR.base + addReferenceOffset);
+			ScriptLibraryR.pRemoveReference = (FARPROC)(ScriptLibraryR.base + removeReferenceOffset);
+			ScriptLibraryR.pOpcode_24_CALL = (FARPROC)(ScriptLibraryR.base + opcode_24_CALL_Offset);
+			ScriptLibraryR.pGetExceptionHandlersCount = (FARPROC)(ScriptLibraryR.base + getExceptionHandlersCountOffset);
 			ScriptLibraryR.pGetExceptionHandlerCurrentIp = (FARPROC)(ScriptLibraryR.base + getExceptionHandlerCurrentIpOffset);
-			ScriptLibraryR.pParseFileImpl			= (FARPROC)(ScriptLibraryR.base + parseFileImplOffset);
+			ScriptLibraryR.pParseFileImpl = (FARPROC)(ScriptLibraryR.base + parseFileImplOffset);
 			//Statically linked C-runtime functions
-			ScriptLibraryR.pOperator_new			= (FARPROC)(ScriptLibraryR.base + operator_new_Offset);
-			ScriptLibraryR.pFree					= (FARPROC)(ScriptLibraryR.base + freeOffset);
-			ScriptLibraryR.p_strdup					= (FARPROC)(ScriptLibraryR.base + _strdupOffset);
+			ScriptLibraryR.pOperator_new = (FARPROC)(ScriptLibraryR.base + operator_new_Offset);
+			ScriptLibraryR.pFree = (FARPROC)(ScriptLibraryR.base + freeOffset);
+			ScriptLibraryR.p_strdup = (FARPROC)(ScriptLibraryR.base + _strdupOffset);
 			//Internal fields
-			ScriptLibraryR.pHeadersNotLoaded		= (BYTE*)			(ScriptLibraryR.base + headersNotLoadedOffset);
-			ScriptLibraryR.ppCurrentStack			= (Stack**)			(ScriptLibraryR.base + ppCurrentStackOffset);
-			ScriptLibraryR.opcodesImpl				= (OpcodeImpl*)		(ScriptLibraryR.base + opcodesImplOffset);
-			ScriptLibraryR.pStrNotCompiled			= (char**)			(ScriptLibraryR.base + strNotCompiledOffset);
-			ScriptLibraryR.pParseFileDefaultInput	= (UFILE*)			(ScriptLibraryR.base + parseFileDefaultInputOffset);
-			ScriptLibraryR.instructions				= (InstructionVector*)(ScriptLibraryR.base + pInstructionsOffset);
-			ScriptLibraryR.ppCurrentTaskExceptStruct= (ExceptStruct**)	(ScriptLibraryR.base + pCurrentTaskExceptStructOffset);
-			ScriptLibraryR.pMainStack				= (Stack*)			(ScriptLibraryR.base + mainStackOffset);
-			ScriptLibraryR.pTaskList				= (TaskList*)		(ScriptLibraryR.base + pTaskListOffset);
-			ScriptLibraryR.pAutostartScriptsList	= (AutostartScriptsList*)(ScriptLibraryR.base + autostartScriptsListOffset);
-			ScriptLibraryR.pGlobalVarsDecl			= (VarTypeEntry**)	(ScriptLibraryR.base + globalVarsDeclOffset);
-			ScriptLibraryR.globalVars				= (VarVector*)		(ScriptLibraryR.base + pGlobalVarsOffset);
-			ScriptLibraryR.pScriptList				= (ScriptList*)		(ScriptLibraryR.base + pScriptListOffset);
-			ScriptLibraryR.ppDataSection			= (char**)			(ScriptLibraryR.base + pDataSectionOffset);
-			ScriptLibraryR.pDataSectionSize			= (DWORD*)			(ScriptLibraryR.base + dataSectionSizeOffset);
-			ScriptLibraryR.pTicksCount				= (DWORD*)			(ScriptLibraryR.base + ticksCountOffset);
-			ScriptLibraryR.pHighestScriptId			= (DWORD*)			(ScriptLibraryR.base + highestScriptIdOffset);
-			ScriptLibraryR.pScriptInstructionCount	= (DWORD*)			(ScriptLibraryR.base + pScriptInstructionCountOffset);
-			ScriptLibraryR.ppCurrentTask			= (Task**)			(ScriptLibraryR.base + ppCurrentTaskOffset);
-			ScriptLibraryR.pErrorCallback			= (ErrorCallback*)	(ScriptLibraryR.base + errorCallbackOffset);
-			ScriptLibraryR.pTaskVars				= (TaskVar*)		(ScriptLibraryR.base + taskVarsOffset);
-			ScriptLibraryR.pTaskVarsCount			= (DWORD*)			(ScriptLibraryR.base + taskVarsCountOffset);
-			ScriptLibraryR.pParserTraceEnabled		= (DWORD*)			(ScriptLibraryR.base + parserTraceEnabledOffset);
-			ScriptLibraryR.pCurrentFilename			= (char**)			(ScriptLibraryR.base + currentFilenameOffset);
-			ScriptLibraryR.ppParseFileInputStream	= (UFILE**)			(ScriptLibraryR.base + pParseFileInputStreamOffset);
-			ScriptLibraryR.pErrorsCount				= (DWORD**)			(ScriptLibraryR.base + errorsCountOffset);
+			ScriptLibraryR.pHeadersNotLoaded = (BYTE*)(ScriptLibraryR.base + headersNotLoadedOffset);
+			ScriptLibraryR.ppCurrentStack = (Stack**)(ScriptLibraryR.base + ppCurrentStackOffset);
+			ScriptLibraryR.opcodesImpl = (OpcodeImpl*)(ScriptLibraryR.base + opcodesImplOffset);
+			ScriptLibraryR.pStrNotCompiled = (char**)(ScriptLibraryR.base + strNotCompiledOffset);
+			ScriptLibraryR.pParseFileDefaultInput = (UFILE*)(ScriptLibraryR.base + parseFileDefaultInputOffset);
+			ScriptLibraryR.pEnumConstants = (EnumConstantVector*)(ScriptLibraryR.base + enumConstantsOffset);
+			ScriptLibraryR.instructions = (InstructionVector*)(ScriptLibraryR.base + pInstructionsOffset);
+			ScriptLibraryR.ppCurrentTaskExceptStruct = (ExceptStruct**)(ScriptLibraryR.base + pCurrentTaskExceptStructOffset);
+			ScriptLibraryR.pMainStack = (Stack*)(ScriptLibraryR.base + mainStackOffset);
+			ScriptLibraryR.pTaskList = (TaskList*)(ScriptLibraryR.base + pTaskListOffset);
+			ScriptLibraryR.pAutostartScriptsList = (AutostartScriptsList*)(ScriptLibraryR.base + autostartScriptsListOffset);
+			ScriptLibraryR.pGlobalVarsDecl = (VarTypeEntry**)(ScriptLibraryR.base + globalVarsDeclOffset);
+			ScriptLibraryR.globalVars = (VarVector*)(ScriptLibraryR.base + pGlobalVarsOffset);
+			ScriptLibraryR.pScriptList = (ScriptList*)(ScriptLibraryR.base + pScriptListOffset);
+			ScriptLibraryR.ppDataSection = (char**)(ScriptLibraryR.base + pDataSectionOffset);
+			ScriptLibraryR.pDataSectionSize = (DWORD*)(ScriptLibraryR.base + dataSectionSizeOffset);
+			ScriptLibraryR.pTicksCount = (DWORD*)(ScriptLibraryR.base + ticksCountOffset);
+			ScriptLibraryR.pHighestScriptId = (DWORD*)(ScriptLibraryR.base + highestScriptIdOffset);
+			ScriptLibraryR.pScriptInstructionCount = (DWORD*)(ScriptLibraryR.base + pScriptInstructionCountOffset);
+			ScriptLibraryR.ppCurrentTask = (Task**)(ScriptLibraryR.base + ppCurrentTaskOffset);
+			ScriptLibraryR.pErrorCallback = (ErrorCallback*)(ScriptLibraryR.base + errorCallbackOffset);
+			ScriptLibraryR.ppNativeFunctions = (NATIVE_FUNCTION**)(ScriptLibraryR.base + nativeFunctionsOffset);
+			ScriptLibraryR.pTaskVars = (TaskVar*)(ScriptLibraryR.base + taskVarsOffset);
+			ScriptLibraryR.pTaskVarsCount = (DWORD*)(ScriptLibraryR.base + taskVarsCountOffset);
+			ScriptLibraryR.pParserTraceEnabled = (DWORD*)(ScriptLibraryR.base + parserTraceEnabledOffset);
+			ScriptLibraryR.pCurrentFilename = (char**)(ScriptLibraryR.base + currentFilenameOffset);
+			ScriptLibraryR.ppParseFileInputStream = (UFILE**)(ScriptLibraryR.base + pParseFileInputStreamOffset);
+			ScriptLibraryR.pErrorsCount = (DWORD**)(ScriptLibraryR.base + errorsCountOffset);
 			//NOPs
 			if (DWORD r = nop((LPVOID)(ScriptLibraryR.base + printParseErrorBeepOffset), MessageBeep_size)) {
 				WARNING("failed to NOP MessageBeep call, error is %i", r);
 			}
 			detourScriptLibraryR();
+			//
+			if (*ScriptLibraryR.pHeadersNotLoaded) {
+				INFO("loading game headers");
+				ScriptLibraryR.loadGameHeaders(gamePath);
+				*ScriptLibraryR.pHeadersNotLoaded = false;
+			}
+			INFO("mapping script object types");
+			std::unordered_map<std::string, int> scriptObjectTypes;
+			int i = 0;
+			for (StringObj* name = ScriptLibraryR.pEnumConstants->names.pFirst; name < ScriptLibraryR.pEnumConstants->names.pEnd; name++, i++) {
+				if (strncmp(name->bytes, "SCRIPT_OBJECT_TYPE_", 19) == 0) {
+					int val = ScriptLibraryR.pEnumConstants->values.pFirst[i];
+					scriptObjectTypes[std::string(name->bytes)] = val;
+					rScriptObjectTypes[val] = name->bytes;
+					TRACE("%s = %i", name->bytes, val);
+				}
+			}
+			INFO("mapping script object subtypes");
+			for (auto entry : subtypesMap) {
+				std::string sType = entry.first;
+				std::string sSubtype = entry.second;
+				const size_t subtypeLen = sSubtype.length();
+				int type = scriptObjectTypes[sType];
+				auto& rSubtypes = rScriptObjectSubtypes[type];
+				i = 0;
+				for (StringObj* name = ScriptLibraryR.pEnumConstants->names.pFirst; name < ScriptLibraryR.pEnumConstants->names.pEnd; name++, i++) {
+					if (strncmp(name->bytes, sSubtype.c_str(), subtypeLen) == 0) {
+						int val = ScriptLibraryR.pEnumConstants->values.pFirst[i];
+						rSubtypes[val] = name->bytes;
+					}
+				}
+				TRACE("%s -> %s", sType, sSubtype);
+			}
 		} else {
 			Fail("ERROR: this debugger.dll can work only with LHVM 8 (Black & White: Creature Isle runtime)");
 		}
@@ -2715,21 +2832,41 @@ Game* __fastcall GScript__Reset_Detour(DWORD* _this, int edx, int a) {
 	return  GScript__Reset(_this, a);
 }
 
-char __fastcall BWCheckFeatureIsEnabled_Detour(char* _this, int edx) {
+/*char __fastcall BWCheckFeatureIsEnabled_Detour(char* _this, int edx) {
 	return BWCheckFeatureIsEnabled(_this);
-}
+}*/
 
 bool __fastcall GSetup__LoadMapScript_Detour(int edx) {
 	TRACE("reading map...");
 	return GSetup__LoadMapScript();
 }
 
+void processWindowOptions() {
+	HWND consoleWindow = GetConsoleWindow();
+	HWND gameWindow = findProcessWindowExcluding(NULL, consoleWindow);
+	char buffer[1024];
+	char* argv[32];
+	strcpy(buffer, GetCommandLineA());
+	int argc = splitArgs(buffer, ' ', argv, 32);
+	char* windowpos = getArgVal(argv, argc, "/windowpos");
+	if (windowpos != NULL) {
+		setWindowPos(gameWindow, windowpos);
+	}
+	bool windowtop = getArgFlag(argv, argc, "/windowtop");
+	if (windowtop) {
+		SetWindowPos(gameWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+	}
+}
+
 signed int __fastcall GGame__Init_Detour(void* _this, int edx) {
-	INFO("GGame_Init");
+	DEBUG("GGame_Init");
+	processWindowOptions();
+	//
 	int buffer = GGame__Init(_this);
 	int buffer2 = edx;
 	edx = buffer2;
-	debugger->init();
+	//initCalled = true;
+	//debugger->init();
 	return buffer;
 }
 
@@ -2747,7 +2884,7 @@ void init_mods() {
 	DETOUR(GGame__StartGame, GGame__StartGame_Detour);
 	DETOUR(GGame__Loop, GGame__Loop_Detour);
 	DETOUR(PauseGame, PauseGame_Detour);
-	DETOUR(BWCheckFeatureIsEnabled, BWCheckFeatureIsEnabled_Detour);
+	//DETOUR(BWCheckFeatureIsEnabled, BWCheckFeatureIsEnabled_Detour);
 	DETOUR(GGame__Init, GGame__Init_Detour);
 	DETOUR(ControlMap__ProcessActionsPerformed, ControlMap__ProcessActionsPerformed_Detour);
 
@@ -2762,67 +2899,87 @@ void deinit_mods() {
 	debugger->term();
 }
 
+void printInfo() {
+	const char* supportedEngines[10];
+	int enginesCount = 0;
+#ifdef DEBUGGER_GDB
+	supportedEngines[enginesCount++] = "gdb";
+#endif
+#ifdef DEBUGGER_XDEBUG
+	supportedEngines[enginesCount++] = "xdebug";
+#endif
+	printf("\nBlack & White: Creature Isle debugger by Daniels118\n");
+	printf("Version: 0.2 alpha\n");
+	printf("Supported engines: ");
+	if (enginesCount > 0) {
+		printf("%s", supportedEngines[0]);
+		for (int i = 1; i < enginesCount; i++) {
+			printf(", %s", supportedEngines[i]);
+		}
+	}
+	printf("\n\n");
+}
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReserved) {
-	char* cmd;
 	char buffer[1024];
 	char* argv[32];
 	int argc;
 	bool useGdb, useXDebug;
 	switch (ul_reason_for_call) {
-        case DLL_PROCESS_ATTACH:
-			cmd = GetCommandLineA();
-			useGdb = strstr(cmd, " /gdb") != NULL;
-			useXDebug = strstr(cmd, " /xdebug") != NULL;
-			debugging = useGdb || useXDebug || strstr(cmd, " /debug") != NULL;
-			if (debugging) {
-				if (useXDebug) {
-					#ifdef DEBUGGER_XDEBUG
-						debugger = new XDebug();
-					#else
-						ERR("xdebug is not supported");
-					#endif
-				} else {
-					#ifdef DEBUGGER_GDB
-						debugger = new Gdb();
-					#else
-						ERR("gdb is not supported");
-					#endif
-				}
-				if (debugger == NULL) {
-					debugging = false;
-					ERR("debugger not set");
-				}
-			}
-			if (debugging) {
-				strcpy(buffer, cmd);
-				argc = splitArgs(buffer, ' ', argv, 32);
-				char* sources = getArgVal(argv, argc, "/debug:src");
-				if (sources != NULL) {
-					char* dirs[32];
-					int nDirs = splitArgs(sources, ';', dirs, 32);
-					for (int i = 0; i < nDirs; i++) {
-						sourcePath.insert(dirs[i]);
-					}
-				}
-				char* incDir = getArgVal(argv, argc, "/debug:inc");
-				if (incDir != NULL) {
-					strcpy(gamePath, incDir);
-				} else {
-					GetModuleFileNameA(NULL, gamePath, MAX_PATH);
-					strrchr(gamePath, '\\')[1] = 0;	//Remove EXE filename
-				}
-				init_mods();
+	case DLL_PROCESS_ATTACH:
+		printInfo();
+		strcpy(buffer, GetCommandLineA());
+		argc = splitArgs(buffer, ' ', argv, 32);
+		//
+		useGdb = getArgFlag(argv, argc, "/gdb");
+		useXDebug = getArgFlag(argv, argc, "/xdebug");
+		debugging = useGdb || useXDebug;
+		if (debugging) {
+			if (useXDebug) {
+#ifdef DEBUGGER_XDEBUG
+				debugger = new XDebug();
+#else
+				ERR("xdebug is not supported");
+#endif
 			} else {
-				printf("Debugger is not enabled. Start with /debug option to enable\n");
+#ifdef DEBUGGER_GDB
+				debugger = new Gdb();
+#else
+				ERR("gdb is not supported");
+#endif
 			}
-            break;
-        case DLL_PROCESS_DETACH:
-			if (debugging) {
-				deinit_mods();
+			if (debugger == NULL) {
+				debugging = false;
+				ERR("debugger not set");
 			}
-            break;
-    }
-    return TRUE;
+		}
+		if (debugging) {
+			char* sources = getArgVal(argv, argc, "/debug:src");
+			if (sources != NULL) {
+				char* dirs[32];
+				int nDirs = splitArgs(sources, ';', dirs, 32);
+				for (int i = 0; i < nDirs; i++) {
+					sourcePath.insert(dirs[i]);
+				}
+			}
+			char* incDir = getArgVal(argv, argc, "/debug:inc");
+			if (incDir != NULL) {
+				strcpy(gamePath, incDir);
+			} else {
+				GetModuleFileNameA(NULL, gamePath, MAX_PATH);
+				strrchr(gamePath, '\\')[1] = 0;	//Remove EXE filename
+			}
+			init_mods();
+		} else {
+			printf("Debugger is not enabled. Start with /debug option to enable\n");
+		}
+		break;
+	case DLL_PROCESS_DETACH:
+		if (debugging) {
+			deinit_mods();
+		}
+		break;
+	}
+	return TRUE;
 }
 

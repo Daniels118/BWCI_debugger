@@ -5,7 +5,8 @@
  * This software may be distributed under the terms of the BSD license.
  * See README for more details.
  * 
- * Modified by Daniels118 to work with static output buffers (no malloc)
+ * Modified by Daniels118 to work with static output buffers (no malloc),
+ * and tolerate missing '=' padding when decoding.
  */
 
 static const unsigned char base64_table[65] =
@@ -23,7 +24,7 @@ static const unsigned char base64_table[65] =
  * nul terminated to make it easier to use as a C string. The nul terminator is
  * not included in out_len.
  */
-bool base64_encode(const char* src, size_t len, char* out, size_t* out_len) {
+bool base64_encode(const char* src, const size_t len, char* out, size_t* out_len) {
 	unsigned char* pos;
 	const unsigned char* end, * in;
 	size_t olen;
@@ -66,8 +67,8 @@ bool base64_encode(const char* src, size_t len, char* out, size_t* out_len) {
 		line_len += 4;
 	}
 
-	if (line_len)
-		*pos++ = '\n';
+	/*if (line_len)
+		*pos++ = '\n';*/
 
 	*pos = '\0';
 	if (out_len)
@@ -86,9 +87,10 @@ bool base64_encode(const char* src, size_t len, char* out, size_t* out_len) {
  *
  * Caller is responsible for freeing the returned buffer.
  */
-bool base64_decode(const unsigned char* src, size_t len, char* out, size_t* out_len) {
+bool base64_decode(const char* srcstr, const size_t len, char* out, size_t* out_len) {
+	const unsigned char* src = (const unsigned char*)srcstr;
 	unsigned char dtable[256], * pos, block[4], tmp;
-	size_t i, count, olen;
+	size_t i, count;
 	int pad = 0;
 
 	for (i = 0; i < 256; i++)
@@ -97,19 +99,9 @@ bool base64_decode(const unsigned char* src, size_t len, char* out, size_t* out_
 		dtable[base64_table[i]] = (unsigned char)i;
 	dtable['='] = 0;
 
-	count = 0;
-	for (i = 0; i < len; i++) {
-		if (dtable[src[i]] != 0x80)
-			count++;
-	}
-
-	if (count == 0 || count % 4)
-		return NULL;
-
-	olen = count / 4 * 3;
 	pos = (unsigned char*)out;
-	if (out == NULL)
-		return NULL;
+	if (out == 0)
+		return false;
 
 	count = 0;
 	for (i = 0; i < len; i++) {
@@ -121,6 +113,12 @@ bool base64_decode(const unsigned char* src, size_t len, char* out, size_t* out_
 			pad++;
 		block[count] = tmp;
 		count++;
+		if (i == len - 1) {
+			for (; count < 4; count++) {
+				block[count] = 0;
+				pad++;
+			}
+		}
 		if (count == 4) {
 			*pos++ = (block[0] << 2) | (block[1] >> 4);
 			*pos++ = (block[1] << 4) | (block[2] >> 2);
@@ -139,7 +137,8 @@ bool base64_decode(const unsigned char* src, size_t len, char* out, size_t* out_
 			}
 		}
 	}
-
-	*out_len = pos - (unsigned char*)out;
+	*pos = 0;
+	if (out_len != 0)
+		*out_len = pos - (unsigned char*)out;
 	return true;
 }

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 #include <Windows.h>
 
@@ -20,6 +21,13 @@ enum DataTypes {
 	DT_NONE, DT_INT, DT_FLOAT, DT_COORDS, DT_OBJECT, DT_UNK5, DT_BOOLEAN, DT_VAR
 };
 
+enum NativeFunctions {
+	GET_PROPERTY = 18,
+	GET_POSITION = 20,
+	GAME_TYPE = 213,
+	GAME_SUB_TYPE = 214
+};
+
 constexpr int OPCODES_COUNT = 45;
 
 extern DWORD opcode_attrs[OPCODES_COUNT];
@@ -33,8 +41,10 @@ constexpr auto OP_ATTR_VSTACK = 32;
 
 extern std::vector<std::string> opcode_keywords[OPCODES_COUNT][3];
 
-extern const char* NativeFunctions[];
+extern const char* NativeFunctionNames[];
 constexpr auto NATIVE_COUNT = 528;
+
+extern std::unordered_map<std::string, std::string> subtypesMap;
 
 enum VarTypes {
 	VAR_TYPE_REFERENCE = 1,	//?
@@ -204,6 +214,54 @@ typedef DWORD(__cdecl* OpcodeImpl)(Task* pTask, Instruction* pInstr);
 typedef int(__cdecl* ErrorCallback)(DWORD severity, const char* msg);
 typedef int(__cdecl* NativeCallCallback)(DWORD id);
 typedef int(__cdecl* StopTaskCallback)(DWORD taskNumber);
+typedef int(__cdecl* NativeFunction)();
+
+struct NATIVE_FUNCTION {
+	NativeFunction pointer;
+	DWORD stackIn;
+	DWORD stackOut;
+	DWORD unknown;
+	char name[128];
+};
+
+struct StringObj {
+	BYTE b[4];
+	const char* bytes;
+	DWORD len;
+	DWORD bufsize;
+};
+
+struct StringObjVector {
+	StringObj* pFirst;
+	StringObj* pEnd;
+	StringObj* pBufferEnd;
+};
+
+struct IntVector {
+	DWORD unk0;
+	int* pFirst;
+	int* pEnd;
+	int* pBufferEnd;
+};
+
+struct EnumTableEntry {
+	int index;
+	DWORD filler;
+};
+
+struct EnumTable {
+	DWORD unk0;
+	EnumTableEntry* pFirst;
+	EnumTableEntry* pEnd;
+	EnumTableEntry* pBufferEnd;
+};
+
+struct EnumConstantVector {
+	DWORD unk0;
+	StringObjVector names;
+	IntVector values;
+	EnumTable sorted;
+};
 
 struct UFILE {	//Fake type for FILEs handled using the statically linked C-runtime
 	char*	_ptr;
@@ -249,6 +307,7 @@ struct UFILE {	//Fake type for FILEs handled using the statically linked C-runti
 #define opcodesImplOffset				0x25624
 #define strNotCompiledOffset			0x25A98
 #define	parseFileDefaultInputOffset		0x40E38
+#define enumConstantsOffset				0x44798
 #define pInstructionsOffset				0x447DC
 #define pInstructionsEndOffset			0x447E0
 #define pCurrentTaskExceptStructOffset	0x447E8
@@ -268,7 +327,7 @@ struct UFILE {	//Fake type for FILEs handled using the statically linked C-runti
 #define pScriptInstructionCountOffset	0x4497C
 #define ppCurrentTaskOffset				0x44980
 #define errorCallbackOffset				0x44994
-#define pNativeFunctionsOffset			0x44998
+#define nativeFunctionsOffset			0x44998
 #define taskVarsOffset					0x449B0
 #define taskVarsCountOffset				0x459B0
 #define parserTraceEnabledOffset		0x45E6C
@@ -310,7 +369,11 @@ struct ScriptLibraryRDll {
 	FUNC(pOpCode, int(__cdecl* OpCode)());
 	FUNC(pOpCodeName, const char* (__cdecl* OpCodeName)(int, int opcode));
 	FUNC(pPOP, float(__cdecl* POP)(DWORD* pType));						//The argument can be NULL
-	FUNC(pPUSH, Stack* (__cdecl* PUSH)(float value, DWORD type));		//Returns a pointer to the Stack structure
+	FUNC(pPOPI, int(__cdecl* POPI)(DWORD* pType));						//The argument can be NULL
+	FUNC(pPOPU, DWORD(__cdecl* POPU)(DWORD* pType));					//The argument can be NULL
+	FUNC(pPUSH, int(__cdecl* PUSH)(float value, DWORD type));
+	FUNC(pPUSHI, int(__cdecl* PUSHI)(int value, DWORD type));
+	FUNC(pPUSHU, int(__cdecl* PUSHU)(DWORD value, DWORD type));
 	FUNC(pParseFile, int(__cdecl* ParseFile)(int, const char* FileName, const char* directory));
 	FUNC(pParsedFile, int(__cdecl* ParsedFile)(const char* FileName));	//Checks if any script in memory comes from the given file (ignoring path). Returns 0 or 1
 	FUNC(pReboot, int(__cdecl* Reboot)());
@@ -358,6 +421,7 @@ struct ScriptLibraryRDll {
 	OpcodeImpl*			opcodesImpl;				//0x25624
 	char**				pStrNotCompiled;			//0x25A98
 	UFILE*				pParseFileDefaultInput;		//0x40E38
+	EnumConstantVector* pEnumConstants;				//0x44798
 	InstructionVector*	instructions;				//0x447DC
 	ExceptStruct**		ppCurrentTaskExceptStruct;	//0x447E8
 	Stack*				pMainStack;					//0x447F8
@@ -373,6 +437,7 @@ struct ScriptLibraryRDll {
 	DWORD*				pScriptInstructionCount;	//0x4497C
 	Task**				ppCurrentTask;				//0x44980
 	ErrorCallback*		pErrorCallback;				//0x44994
+	NATIVE_FUNCTION**	ppNativeFunctions;			//0x44998
 	TaskVar*			pTaskVars;					//0x449B0
 	DWORD*				pTaskVarsCount;				//0x459B0
 	DWORD*				pParserTraceEnabled;		//0x45E6C

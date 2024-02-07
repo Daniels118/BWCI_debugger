@@ -177,9 +177,9 @@ class Gdb : public Debugger {
 		void onCatchpoint(Task* task, int event) {
 			Instruction* instr = getCurrentInstruction(task);
 			if (event == EV_SYSCALL) {
-				printf("Catchpoint (call to syscall '%s')\n", NativeFunctions[instr->intVal]);
+				printf("Catchpoint (call to syscall '%s')\n", NativeFunctionNames[instr->intVal]);
 			} else if (event == EV_SYSCALL_RET) {
-				printf("Catchpoint (returned from syscall '%s')\n", NativeFunctions[instr->intVal]);
+				printf("Catchpoint (returned from syscall '%s')\n", NativeFunctionNames[instr->intVal]);
 			}
 			printDisplays(task);
 			printCurrentLine(task);
@@ -798,7 +798,7 @@ class Gdb : public Debugger {
 		}
 
 		static bool c_break(char* rawBuffer, int argc, const char* cmd) {
-			int targetHitCount = streq(cmd, "tbreak") ? 1 : 0;
+			bool temporary = streq(cmd, "tbreak");
 			const char* file = NULL;
 			int line = -1;
 			int ip = -1;
@@ -888,7 +888,7 @@ class Gdb : public Debugger {
 			if (file != NULL && line > 0 && ip >= 0) {
 				Breakpoint* breakpoint = setBreakpoint(file, line, ip, thread, sCondition);
 				if (breakpoint != NULL) {
-					breakpoint->targetHitCount = targetHitCount;
+					breakpoint->temporary = temporary;
 					printf("Breakpoint at %i from %s (%i)\n", line, file, ip);
 				}
 			} else {
@@ -964,7 +964,7 @@ class Gdb : public Debugger {
 						for (int j = 2; j < argc; j++) {
 							arg = argv[j];
 							for (int i = 0; i < NATIVE_COUNT; i++) {
-								if (_stricmp(arg, NativeFunctions[i]) == 0) {
+								if (_stricmp(arg, NativeFunctionNames[i]) == 0) {
 									catchSysCalls[i] = ENABLED;
 								}
 							}
@@ -1809,7 +1809,7 @@ class Gdb : public Debugger {
 			for (int i = 0; i < NATIVE_COUNT; i++) {
 				if (catchSysCalls[i]) {
 					const char* enabled = catchSysCalls[i] == ENABLED ? "enabled" : "disabled";
-					printf("%5i catchpoint %-8s %8i %s\n", index++, enabled, 0, NativeFunctions[i]);
+					printf("%5i catchpoint %-8s %8i %s\n", index++, enabled, 0, NativeFunctionNames[i]);
 				}
 			}
 			for (std::string name : catchRunScripts) {
@@ -1945,7 +1945,7 @@ class Gdb : public Debugger {
 				++id;
 				bool show = argc <= 2 || inArray(id, &argv[2], argc - 2);
 				if (show && thread != NULL) {
-					Task* tFrame = getFrame(thread);
+					Task* tFrame = getInnermostFrame(thread);
 					char args[512];
 					formatTaskParameters(tFrame, args);
 					Instruction* instruction = getCurrentInstruction(tFrame);
@@ -2394,27 +2394,6 @@ class Gdb : public Debugger {
 				printf("Invalid property.\n");
 			}
 			return false;
-		}
-
-		static void setWindowPos(const HWND hwnd, char* sVal) {
-			if (streq(sVal, "tl")) {
-				alignWindow(hwnd, NULL, Anchor::TOP_LEFT);
-			} else if (streq(sVal, "tr")) {
-				alignWindow(hwnd, NULL, Anchor::TOP_RIGHT);
-			} else if (streq(sVal, "br")) {
-				alignWindow(hwnd, NULL, Anchor::BOTTOM_RIGHT);
-			} else if (streq(sVal, "bl")) {
-				alignWindow(hwnd, NULL, Anchor::BOTTOM_LEFT);
-			} else {
-				int argc = splitArgs(sVal, ',', argv, 2);
-				if (argc == 2) {
-					int x = atoi(argv[0]);
-					int y = atoi(argv[1]);
-					SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-				} else {
-					printf("Invalid coordinates.\n");
-				}
-			}
 		}
 
 		static bool c_set_instruction(char* rawBuffer, int argc, const char* cmd) {

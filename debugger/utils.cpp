@@ -2,6 +2,9 @@
 
 #include <filesystem>
 #include <fstream>
+#include <shlwapi.h>
+
+#pragma comment(lib, "Shlwapi.lib")
 
 struct HandleData {
     DWORD pid;
@@ -81,6 +84,48 @@ bool alignWindow(HWND window, HWND ref, Anchor anchor) {
     return SetWindowPos(window, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 }
 
+void setWindowPos(const HWND hwnd, const char* pos) {
+    char* argv[2];
+    if (streq(pos, "tl")) {
+        alignWindow(hwnd, NULL, Anchor::TOP_LEFT);
+    } else if (streq(pos, "tr")) {
+        alignWindow(hwnd, NULL, Anchor::TOP_RIGHT);
+    } else if (streq(pos, "br")) {
+        alignWindow(hwnd, NULL, Anchor::BOTTOM_RIGHT);
+    } else if (streq(pos, "bl")) {
+        alignWindow(hwnd, NULL, Anchor::BOTTOM_LEFT);
+    } else {
+        char buf[32];
+        strncpy(buf, pos, 32);
+        int argc = splitArgs(buf, ',', argv, 2);
+        if (argc == 2) {
+            int x = atoi(argv[0]);
+            int y = atoi(argv[1]);
+            SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        } else {
+            printf("Invalid coordinates.\n");
+        }
+    }
+}
+
+std::string pathToUrl(std::string path) {
+    char buffer[MAX_PATH];
+    DWORD size = MAX_PATH;
+    UrlCreateFromPathA(path.c_str(), buffer, &size, NULL);
+    return std::string(buffer);
+}
+
+std::string urlToPath(std::string url) {
+    char buffer[MAX_PATH] = {0};
+    DWORD size = MAX_PATH;
+    HRESULT r = PathCreateFromUrlA(url.c_str(), buffer, &size, NULL);
+    if (r != S_OK) {
+        printf("PathCreateFromUrlA failed with error %i\n", r);
+        return "";
+    }
+    return std::string(buffer);
+}
+
 std::string searchPaths(std::set<std::string> paths, std::string filename) {
     auto filepath = std::filesystem::path(filename);
     if (filepath.is_absolute()) {
@@ -122,6 +167,24 @@ const char* ltrim(const char* str) {
         str++;
     }
     return str;
+}
+
+std::string strSnakeToCamel(std::string str) {
+    std::string r;
+    r.reserve(str.length());
+    bool up = true;
+    for (const char* pc = str.c_str(); *pc != 0; pc++) {
+        char c = *pc;
+        if (c == '_') {
+            up = true;
+        } else if (up) {
+            r += toupper(c);
+            up = false;
+        } else {
+            r += tolower(c);
+        }
+    }
+    return r;
 }
 
 std::string strReplace(const std::string haystack, std::string needle, std::string replacement) {
