@@ -217,6 +217,22 @@ bool strin(const char* str, ...) {
     return res;
 }
 
+bool strEndsWith(const char* str, const char* suffix) {
+    size_t str_len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    return str_len >= suffix_len && !memcmp(str + str_len - suffix_len, suffix, suffix_len);
+}
+
+const char* strrpbrk(const char* str, const char* chrs) {
+    if (str == NULL || chrs == NULL || *str == 0 || *chrs == 0) return NULL;
+    for (int i = strlen(str) - 1; i >= 0; i--) {
+        for (const char* pc = chrs; *pc != 0; pc++) {
+            if (*pc == str[i]) return &(str[i]);
+        }
+    }
+    return NULL;
+}
+
 int rejoinArgsC(char** argv, int argc, int startIndex, int count) {
     for (int i = startIndex + 1; i < MIN(startIndex + count, argc); i++) {
         char* arg = argv[i];

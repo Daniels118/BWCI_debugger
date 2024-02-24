@@ -5,6 +5,8 @@
 #include "ScriptLibraryR.h"
 #include "CHLFile.h"
 #include "debug.h"
+int Breakpoint::nextId = 0;
+
 #include "gdb.h"
 #include "xdebug.h"
 
@@ -41,13 +43,15 @@ char gamePath[MAX_PATH];
 std::set<std::string> sourcePath;
 std::unordered_map<std::string, std::string> sourceFiles;
 std::unordered_map<std::string, std::vector<std::string>> sources;
-std::map<int, Breakpoint*> breakpoints;
-std::map<std::string, Watch*> watches;
+std::map<int, Breakpoint*> allBreakpoints;
+std::unordered_map<int, LineBreakpoint*> lineBreakpoints;
+std::list<Watch*> watches;
 DWORD lastBreakLine;
+DWORD lastStepLine;
 Task* steppingThread = NULL;
-Task* catchThread = NULL;
-BYTE catchSysCalls[NATIVE_COUNT];
-std::set<std::string> catchRunScripts;
+SyscallCatchpoint* catchSysCalls[NATIVE_COUNT];
+std::map<std::string, CallCatchpoint*> catchCallScripts;
+std::map<std::string, RunCatchpoint*> catchRunScripts;
 DWORD breakFromAddress = 0;
 int breakAfterLines = 0;
 int breakAfterInstructions = 0;
@@ -84,8 +88,11 @@ bool gamePaused = false;
 
 const char* scriptsToStopFilename = NULL;
 
+std::unordered_map<std::string, int> ScriptObjectTypes;
 std::unordered_map<int, const char*> rScriptObjectTypes;
 std::unordered_map<int, std::unordered_map<int, const char*>> rScriptObjectSubtypes;
+
+std::map<std::string, int> ObjectProperties;
 
 int __cdecl errorCallback(DWORD severity, const char* msg);
 int getScriptSize(Script* script);
@@ -133,6 +140,16 @@ LONG detour(PVOID* ppPointer, PVOID pDetour, const char* name) {
 
 void callNativeFunction(NativeFunctions id) {
 	(*ScriptLibraryR.ppNativeFunctions)[id].pointer();
+}
+
+void getObjectProperty(DWORD objId, int prop, Var* out) {
+	ScriptLibraryR.PUSHI(prop, DataTypes::DT_INT);
+	ScriptLibraryR.PUSHU(objId, DataTypes::DT_OBJECT);
+	callNativeFunction(NativeFunctions::GET_PROPERTY);
+	int i = (*ScriptLibraryR.ppCurrentStack)->count - 1;
+	out->type = (*ScriptLibraryR.ppCurrentStack)->types[i];
+	out->uintVal = (*ScriptLibraryR.ppCurrentStack)->uintVals[i];
+	ScriptLibraryR.POP(NULL);
 }
 
 int getObjectType(DWORD objId) {
@@ -1013,14 +1030,15 @@ int ScriptLibraryR_StartScript(int a1, const char* scriptName, int allowedScript
 
 void debugger_execute_pre(Task* task) {
 	Instruction* instruction = getCurrentInstruction(task);
+	debugger->beforeInstruction(task);
 	if (pause) {
 		pause = false;
 		breakAfterInstructions = 0;
 		breakAfterLines = 0;
 		lastBreakLine = instruction->linenumber;
 		debugger->onPauseBeforeLine(task);
-	} else if (breakpoints.contains(task->ip)) {
-		Breakpoint* breakpoint = breakpoints[task->ip];
+	} else if (lineBreakpoints.contains(task->ip)) {
+		LineBreakpoint* breakpoint = lineBreakpoints[task->ip];
 		if (breakpoint->isEnabled() && !breakpoint->disabledByTrigger
 			&& (breakpoint->thread == NULL || breakpoint->thread == getThread(task))) {
 			bool hit = true;
@@ -1039,7 +1057,7 @@ void debugger_execute_pre(Task* task) {
 					if (breakpoint->temporary || breakpoint->targetHitCount) {
 						breakpoint->setEnabled(false);
 					}
-					debugger->breakpointHit(task, breakpoint);
+					debugger->onBreakpoint(task, breakpoint);
 				}
 			}
 		}
@@ -1060,13 +1078,11 @@ void debugger_execute_pre(Task* task) {
 			if (--breakAfterInstructions == 0) {
 				lastBreakLine = instruction->linenumber;
 				debugger->onPauseBeforeInstruction(task);
-			} else {
-				debugger->beforeInstruction(task);
 			}
 		}
 	} else if (breakAfterLines > 0 && (steppingThread == NULL || getThread(task) == steppingThread)
 		&& (!task->inExceptionHandler || tasksInfo[task->taskNumber]->exceptionMatched)) {
-		if (instruction->linenumber != lastBreakLine /*|| instruction->opcode == JMP*/ || instruction->opcode == JZ) {
+		if (instruction->linenumber != lastStepLine /*|| instruction->opcode == JMP*/ || instruction->opcode == JZ) {
 			if (getFrameDepth(task) <= stepInMaxDepth) {
 				if (--breakAfterLines == 0) {
 					lastBreakLine = instruction->linenumber;
@@ -1077,11 +1093,12 @@ void debugger_execute_pre(Task* task) {
 			}
 		}
 	} else if (instruction->opcode == Opcodes::SYS
-		&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal] == ENABLED) {
-		debugger->onCatchpoint(task, EV_SYSCALL);
+		&& instruction->intVal >= 0 && instruction->intVal < NATIVE_COUNT && catchSysCalls[instruction->intVal]) {
+		debugger->onCatchpoint(task, (Breakpoint**)&catchSysCalls[instruction->intVal], 1);
 	} else if (instruction->opcode == Opcodes::CALL && catchRunScripts.contains(getScriptById(instruction->intVal)->name)) {
-		debugger->onCatchpoint(task, EV_RUN);
+		debugger->onCatchpoint(task, (Breakpoint**)&catchRunScripts[getScriptById(instruction->intVal)->name], 1);
 	}
+	lastStepLine = instruction->linenumber;
 }
 
 void debugger_execute_post(Task* task) {
@@ -1091,43 +1108,36 @@ void debugger_execute_post(Task* task) {
 		if (instruction->opcode == JZ && !tasksInfo[task->taskNumber]->exceptionMatched) {
 			bool cond = task->stack.intVals[task->stack.count] != 0;	//The condition has been popped but the value is still on the stack
 			if (cond) {
-				if (catchThread != NULL || getThread(task) == catchThread) {
-					tasksInfo[task->taskNumber]->exceptionMatched = true;
-					exception = true;
-				}
+				//We can catch exceptions here
 			}
 		} else if (instruction->opcode == ITEREXCEPT || instruction->opcode == ENDEXCEPT || instruction->opcode == BRKEXCEPT) {
 			tasksInfo[task->taskNumber]->exceptionMatched = false;
 		}
 	}
 	//
-	std::list<Watch*> watchesMatched;
-	for (auto entry : watches) {
-		Watch* watch = entry.second;
-		if (watch->isEnabled()) {
-			watch->oldValue = watch->newValue;
-			watch->matched = false;
-			if (watch->getExpression()->script == NULL || watch->getExpression()->script->id == task->scriptID) {
-				Var* pNewVal = evalExpression(task, watch->getExpression());
-				if (pNewVal != NULL) {
-					float newVal = pNewVal->floatVal;
-					bool oldNaN = std::isnan(watch->oldValue);
-					bool newNaN = std::isnan(newVal);
-					if (newVal != watch->oldValue && !(oldNaN && newNaN)) {
-						watch->newValue = newVal;
-						watch->matched = true;
-						watchesMatched.push_back(watch);
-					}
+	Breakpoint* watchesMatched[100];
+	size_t count = 0;
+	for (Watch* watch : watches) {
+		watch->oldValue = watch->newValue;
+		watch->matched = false;
+		if (watch->getCondition()->script == NULL || watch->getCondition()->script->id == task->scriptID) {
+			Var* pNewVal = evalExpression(task, watch->getCondition());
+			if (pNewVal != NULL) {
+				float newVal = pNewVal->floatVal;
+				bool oldNaN = std::isnan(watch->oldValue);
+				bool newNaN = std::isnan(newVal);
+				if (newVal != watch->oldValue && !(oldNaN && newNaN)) {
+					watch->newValue = newVal;
+					watch->matched = true;
+					watchesMatched[count++] = watch;
 				}
 			}
 		}
 	}
 	//
-	if (exception || !watchesMatched.empty()) {
+	if (exception || count > 0) {
 		lastBreakLine = instruction->linenumber;
-		debugger->onException(task, exception, watchesMatched);
-	} else if (instruction->opcode == SYS && catchSysCalls[instruction->intVal] == ENABLED) {
-		debugger->onCatchpoint(task, EV_SYSCALL_RET);
+		debugger->onCatchpoint(task, watchesMatched, count);
 	}
 }
 
@@ -1578,6 +1588,7 @@ Expression* compileExpression0(Script* script, const std::string sExpression, in
 		printf("%i: %s\n", i, buffer);
 		if (instr->opcode == END) break;
 	}
+	//PAUSE;
 #endif
 	//
 	Expression* expr = new Expression(sExpression, datatype, script, globalsCount, start, size, instructionAddress);
@@ -1782,23 +1793,15 @@ Var* evalExpression(Task* context, Expression* expr) {
 		return getVarById(context, expr->varId);
 	}
 	Task evalTask;
-	const int addedVarsCount = expr->datatype == DT_COORDS ? 4 : 1;
-	evalTask.globalsCount = expr->globalsCount;
-	//
-	Var* result;
-	if (expr->datatype == DT_COORDS) {
-		result = getVarById(NULL, debugger_result_coord_id);
-	} else {
-		result = getVarById(NULL, debugger_result_id);
-	}
-	//
 	evalTask.currentExceptionHandlerIndex = 0;
 	evalTask.exceptionHandlerIps.pFirst = 0;
 	evalTask.exceptionHandlerIps.pEnd = 0;
 	evalTask.filename = (char*)"__debugger";
+	evalTask.globalsCount = expr->globalsCount;
 	evalTask.inExceptionHandler = 0;
 	evalTask.instructionAddress = expr->instructionAddress;
 	evalTask.ip = expr->instructionAddress;
+	evalTask.localVars = context->localVars;
 	evalTask.name = (char*)"__debugger";
 	evalTask.prevIp = expr->instructionAddress;
 	evalTask.scriptID = -1;
@@ -1817,19 +1820,23 @@ Var* evalExpression(Task* context, Expression* expr) {
 	Task* prevTask = currentTask;
 	currentTask = &evalTask;
 	while (!evalTask.stop) {
-		Instruction& instruction = ScriptLibraryR.instructions->pFirst[evalTask.ip];
+		Instruction* instruction = &ScriptLibraryR.instructions->pFirst[evalTask.ip];
 #if LOG_LEVEL >= LL_TRACE
 		char buffer[80];
-		formatTaskInstruction(&evalTask, &instruction, buffer);
+		formatTaskInstruction(&evalTask, instruction, buffer);
 		TRACE("eval: %i: %s", evalTask.ip, buffer);
 #endif
-		OpcodeImpl opcodeImpl = ScriptLibraryR.opcodesImpl[instruction.opcode];
-		opcodeImpl(currentTask, &instruction);
+		OpcodeImpl opcodeImpl = ScriptLibraryR.opcodesImpl[instruction->opcode];
+		opcodeImpl(currentTask, instruction);
 		++evalTask.ip;
 	}
 	currentTask = prevTask;
 	//
-	return result;
+	if (expr->datatype == DT_COORDS) {
+		return getVarById(NULL, debugger_result_coord_id);
+	} else {
+		return getVarById(NULL, debugger_result_id);
+	}
 }
 
 Var* evalString(Task* context, std::string expression, int& datatype) {
@@ -2357,9 +2364,50 @@ bool updateCHL(const char* filename, bool stopAllInChangedFiles) {
 	return true;
 }
 
-Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* thread, const char* sCondition) {
-	if (breakpoints.contains(ip)) {
-		debugger->onMessage(3, "a breakpoint exists at instruction %i", ip);
+std::vector<Breakpoint*> getBreakpoints() {
+	auto res = std::vector<Breakpoint*>();
+	res.reserve(allBreakpoints.size());
+	for (auto entry : allBreakpoints) {
+		res.push_back(entry.second);
+	}
+	return res;
+}
+
+Breakpoint* getBreakpointById(int id) {
+	if (allBreakpoints.contains(id)) {
+		return allBreakpoints[id];
+	} else {
+		return NULL;
+	}
+}
+
+Breakpoint* getBreakpointByIndex(DWORD index) {
+	if (index >= 0 && index < (int)allBreakpoints.size()) {
+		auto it = allBreakpoints.begin();
+		std::advance(it, index);
+		return (*it).second;
+	} else {
+		return NULL;
+	}
+}
+
+bool unsetBreakpoint(Breakpoint* breakpoint) {
+	if (allBreakpoints.contains(breakpoint->getId())) {
+		printf("unsetting breakpoint...\n");
+		if (breakpoint->getCondition() != NULL) {
+			unusedExpressionsSize += breakpoint->getCondition()->getSize();
+		}
+		allBreakpoints.erase(breakpoint->getId());
+		delete breakpoint;
+		return true;
+	} else {
+		return false;
+	}
+}
+
+LineBreakpoint* setLineBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* thread, const char* sCondition) {
+	if (getBreakpointAtAddress(ip) != NULL) {
+		debugger->onMessage(3, "Breakpoint at address %i already exists.", ip);
 		return NULL;
 	}
 	Script* script = findScriptByIp(ip);
@@ -2367,7 +2415,7 @@ Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* th
 		debugger->onMessage(3, "cannot find script for instruction at %i", ip);
 		return NULL;
 	}
-	Breakpoint* breakpoint = new Breakpoint(filename, lineno, script, ip, thread);
+	LineBreakpoint* breakpoint = new LineBreakpoint(filename, lineno, script, ip, thread);
 	if (sCondition != NULL) {
 		Expression* cond = getCompiledExpression(script, sCondition, DT_BOOLEAN);
 		if (cond == NULL) {
@@ -2377,64 +2425,44 @@ Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* th
 		breakpoint->setCondition(cond);
 		unusedExpressionsSize -= cond->getSize();
 	}
-	breakpoints[ip] = breakpoint;
+	allBreakpoints[breakpoint->getId()] = breakpoint;
 	TRACE("breakpoint set at %i", ip);
 	return breakpoint;
 }
 
-bool unsetBreakpoint(Breakpoint* breakpoint) {
-	if (breakpoints.contains(breakpoint->ip)) {
-		breakpoints.erase(breakpoint->ip);
-		if (breakpoint->getCondition() != NULL) {
-			unusedExpressionsSize += breakpoint->getCondition()->getSize();
-		}
-		delete breakpoint;
-		return true;
-	} else {
-		return false;
-	}
-}
-
-Breakpoint* getBreakpointByIndex(DWORD index) {
-	if (index >= 0 && index < (int)breakpoints.size()) {
-		auto it = breakpoints.begin();
-		std::advance(it, index);
-		return (*it).second;
-	} else {
-		return NULL;
-	}
-}
-
-Breakpoint* getBreakpointAtLine(std::string filename, DWORD lineno) {
-	for (auto entry : breakpoints) {
-		Breakpoint* breakpoint = entry.second;
-		if (breakpoint->lineno == lineno && breakpoint->filename == filename) {
-			return breakpoint;
+LineBreakpoint* getBreakpointAtLine(std::string filename, DWORD lineno) {
+	for (auto entry : allBreakpoints) {
+		if (entry.second->getType() == BreakpointType::LINE) {
+			LineBreakpoint* breakpoint = (LineBreakpoint*)entry.second;
+			if (breakpoint->lineno == lineno && breakpoint->filename == filename) {
+				return breakpoint;
+			}
 		}
 	}
 	return NULL;
 }
 
-Breakpoint* getBreakpointAtAddress(int ip) {
-	if (ip >= 0 && ip < getTotalInstructions()) {
-		return breakpoints[ip];
-	} else {
-		return NULL;
+LineBreakpoint* getBreakpointAtAddress(int ip) {
+	for (auto entry : allBreakpoints) {
+		if (entry.second->getType() == BreakpointType::LINE) {
+			LineBreakpoint* breakpoint = (LineBreakpoint*)entry.second;
+			if (breakpoint->ip == ip) {
+				return breakpoint;
+			}
+		}
 	}
-}
-
-std::list<Breakpoint*> getBreakpoints() {
-	auto res = std::list<Breakpoint*>();
-	for (auto entry : breakpoints) {
-		Breakpoint* breakpoint = entry.second;
-		res.push_back(breakpoint);
-	}
-	return res;
+	return NULL;
 }
 
 bool setCondition(Breakpoint* breakpoint, const char* condition) {
 	if (condition != NULL) {
-		Expression* expr = getCompiledExpression(breakpoint->script, condition, DT_BOOLEAN);
+		Script* script = NULL;
+		if (breakpoint->getType() == BreakpointType::LINE) {
+			script = ((LineBreakpoint*)breakpoint)->script;
+		} else if (breakpoint->getType() == BreakpointType::WATCH) {
+			script = ((Watch*)breakpoint)->getCondition()->script;
+		}
+		Expression* expr = getCompiledExpression(script, condition, DT_BOOLEAN);
 		if (expr == NULL) return false;
 		if (breakpoint->getCondition() != NULL) {
 			unusedExpressionsSize += breakpoint->getCondition()->getSize();
@@ -2451,6 +2479,10 @@ bool setCondition(Breakpoint* breakpoint, const char* condition) {
 }
 
 Watch* addWatch(Task* task, const char* expression) {
+	if (getWatchByExpression(task, expression) != NULL) {
+		debugger->onMessage(3, "Watch '%s' already exists.", expression);
+		return NULL;
+	}
 	//Try in global context first
 	TRACE("trying to compile expression in global context");
 	ParserMessages messages;
@@ -2481,58 +2513,92 @@ Watch* addWatch(Task* task, const char* expression) {
 	}
 	Watch* watch = new Watch(task, expr);
 	unusedExpressionsSize -= expr->getSize();
-	const std::string key = watch->getKey();
-	if (watches.contains(key)) {
-		debugger->onMessage(2, "Watch already exists.");
-		delete watch;
-		watch = watches[key];
-	} else {
-		Var* val = evalExpression(task, expr);
-		if (val != NULL) {
-			DEBUG("initial value: %f", val->floatVal);
-			watch->oldValue = val->floatVal;
-		}
-		watches[key] = watch;
+	Var* val = evalExpression(task, expr);
+	if (val != NULL) {
+		DEBUG("initial value: %f", val->floatVal);
+		watch->oldValue = val->floatVal;
 	}
+	allBreakpoints[watch->getId()] = watch;
 	return watch;
 }
 
-std::list<Watch*> getWatches() {
-	std::list<Watch*> res;
-	for (auto entry : watches) {
-		res.push_back(entry.second);
-	}
-	return res;
-}
-
-Watch* getWatchByIndex(DWORD index) {
-	if (index >= 0 && index < (int)watches.size()) {
-		auto it = watches.begin();
-		std::advance(it, index);
-		return (*it).second;
-	} else {
-		return NULL;
-	}
-}
-
 Watch* getWatchByExpression(Task* task, std::string expr) {
-	std::string key = "{" + (task == NULL ? std::string("0") : std::to_string(task->taskNumber)) + "} " + expr;
-	if (watches.contains(key)) {
-		return watches[key];
-	} else {
-		return NULL;
+	for (auto entry : allBreakpoints) {
+		if (entry.second->getType() == BreakpointType::WATCH) {
+			Watch* watch = (Watch*)entry.second;
+			if (watch->getCondition()->str == expr) {
+				return watch;
+			}
+		}
 	}
+	return NULL;
+	
 }
 
-bool deleteWatch(Watch* watch) {
-	if (watches.contains(watch->getKey())) {
-		watches.erase(watch->getKey());
-		unusedExpressionsSize += watch->getExpression()->getSize();
-		delete watch;
-		return true;
-	} else {
-		return false;
+SyscallCatchpoint* setSyscallCatchpoint(int syscall) {
+	if (getSyscallCatchpoint(syscall) != NULL) {
+		debugger->onMessage(3, "Catchpoint for syscall %i exists.", syscall);
+		return NULL;
 	}
+	SyscallCatchpoint* catchpoint = new SyscallCatchpoint(syscall);
+	allBreakpoints[catchpoint->getId()] = catchpoint;
+	return catchpoint;
+}
+
+SyscallCatchpoint* getSyscallCatchpoint(int syscall) {
+	for (auto entry : allBreakpoints) {
+		if (entry.second->getType() == BreakpointType::SYSCALL) {
+			SyscallCatchpoint* catchpoint = (SyscallCatchpoint*)entry.second;
+			if (catchpoint->getSyscall() == syscall) {
+				return catchpoint;
+			}
+		}
+	}
+	return NULL;
+}
+
+CallCatchpoint* setCallCatchpoint(std::string script) {
+	if (getCallCatchpoint(script) != NULL) {
+		debugger->onMessage(3, "Catchpoint for script call '%s' exists.", script.c_str());
+		return NULL;
+	}
+	CallCatchpoint* catchpoint = new CallCatchpoint(script);
+	allBreakpoints[catchpoint->getId()] = catchpoint;
+	return catchpoint;
+}
+
+CallCatchpoint* getCallCatchpoint(std::string script) {
+	for (auto entry : allBreakpoints) {
+		if (entry.second->getType() == BreakpointType::CALL) {
+			CallCatchpoint* catchpoint = (CallCatchpoint*)entry.second;
+			if (catchpoint->getScript() == script) {
+				return catchpoint;
+			}
+		}
+	}
+	return NULL;
+}
+
+RunCatchpoint* setRunCatchpoint(std::string script) {
+	if (getRunCatchpoint(script) != NULL) {
+		debugger->onMessage(3, "Catchpoint for background script '%s' exists.", script.c_str());
+		return NULL;
+	}
+	RunCatchpoint* catchpoint = new RunCatchpoint(script);
+	allBreakpoints[catchpoint->getId()] = catchpoint;
+	return catchpoint;
+}
+
+RunCatchpoint* getRunCatchpoint(std::string script) {
+	for (auto entry : allBreakpoints) {
+		if (entry.second->getType() == BreakpointType::RUN) {
+			RunCatchpoint* catchpoint = (RunCatchpoint*)entry.second;
+			if (catchpoint->getScript() == script) {
+				return catchpoint;
+			}
+		}
+	}
+	return NULL;
 }
 
 DWORD __cdecl ScriptLibraryR_doStartScript(Script* pScript) {
@@ -2559,13 +2625,15 @@ DWORD __cdecl ScriptLibraryR_doStartScript(Script* pScript) {
 
 int __cdecl ScriptLibraryR_stopTask0(Task* pTask) {
 	TRACE("ScriptLibraryR_stopTask0(%p)", pTask);
-	for (auto it = watches.begin(); it != watches.end(); it++) {
-		Watch* watch = (*it).second;
-		if (watch->task == pTask) {
-			debugger->onMessage(1, "Watch removed: %s", watch->getExpression()->str.c_str());
-			it = watches.erase(it);
-			delete watch;
-			it--;
+	for (auto it = allBreakpoints.begin(); it != allBreakpoints.end(); it++) {
+		if (it->second->getType() == BreakpointType::WATCH) {
+			Watch* watch = (Watch*)it->second;
+			if (watch->task == pTask) {
+				debugger->onMessage(1, "Watch removed: %s", watch->getCondition()->str.c_str());
+				it = allBreakpoints.erase(it);
+				delete watch;
+				it--;
+			}
 		}
 	}
 	//
@@ -2762,14 +2830,17 @@ void initScriptLibraryR() {
 				*ScriptLibraryR.pHeadersNotLoaded = false;
 			}
 			INFO("mapping script object types");
-			std::unordered_map<std::string, int> scriptObjectTypes;
 			int i = 0;
 			for (StringObj* name = ScriptLibraryR.pEnumConstants->names.pFirst; name < ScriptLibraryR.pEnumConstants->names.pEnd; name++, i++) {
+				int val = ScriptLibraryR.pEnumConstants->values.pFirst[i];
 				if (strncmp(name->bytes, "SCRIPT_OBJECT_TYPE_", 19) == 0) {
-					int val = ScriptLibraryR.pEnumConstants->values.pFirst[i];
-					scriptObjectTypes[std::string(name->bytes)] = val;
+					ScriptObjectTypes[std::string(name->bytes)] = val;
 					rScriptObjectTypes[val] = name->bytes;
 					TRACE("%s = %i", name->bytes, val);
+				} else if (strncmp(name->bytes, "SCRIPT_OBJECT_PROPERTY_TYPE_", 28) == 0) {
+					if (!strEndsWith(name->bytes, "_NONE") && !strEndsWith(name->bytes, "_LAST")) {
+						ObjectProperties[name->bytes] = val;
+					}
 				}
 			}
 			INFO("mapping script object subtypes");
@@ -2777,7 +2848,7 @@ void initScriptLibraryR() {
 				std::string sType = entry.first;
 				std::string sSubtype = entry.second;
 				const size_t subtypeLen = sSubtype.length();
-				int type = scriptObjectTypes[sType];
+				int type = ScriptObjectTypes[sType];
 				auto& rSubtypes = rScriptObjectSubtypes[type];
 				i = 0;
 				for (StringObj* name = ScriptLibraryR.pEnumConstants->names.pFirst; name < ScriptLibraryR.pEnumConstants->names.pEnd; name++, i++) {
@@ -2808,38 +2879,38 @@ int __fastcall GGame__LoadScriptLibrary_Detour(void* _this, int edx, int a2) {
 	return r;
 }
 
-void __fastcall GGame__ClearMap_Detour(void* _this, int edx) {
+/*void __fastcall GGame__ClearMap_Detour(void* _this, int edx) {
 	GGame__ClearMap(_this);
 	TRACE("map cleared");
-}
+}*/
 
-void __fastcall ProcessGraphicsEngine(Game* _this, int edx) {
+/*void __fastcall ProcessGraphicsEngine(Game* _this, int edx) {
 	IsMultiplayerGame(_this);
-}
+}*/
 
-void __fastcall GGame__StartGame_Detour(Game* _this, int edx) {
+/*void __fastcall GGame__StartGame_Detour(Game* _this, int edx) {
 	TRACE("game started");
 	GGame__StartGame(_this);
-}
+}*/
 
-void __fastcall GGame__Loop_Detour(void* _this, int edx) {
+/*void __fastcall GGame__Loop_Detour(void* _this, int edx) {
 	INFO("GGame::Loop - Starting...");
 	GGame__Loop(_this);
-}
+}*/
 
-Game* __fastcall GScript__Reset_Detour(DWORD* _this, int edx, int a) {
+/*Game* __fastcall GScript__Reset_Detour(DWORD* _this, int edx, int a) {
 	TRACE("GScript Loop - Started");
 	return  GScript__Reset(_this, a);
-}
+}*/
 
 /*char __fastcall BWCheckFeatureIsEnabled_Detour(char* _this, int edx) {
 	return BWCheckFeatureIsEnabled(_this);
 }*/
 
-bool __fastcall GSetup__LoadMapScript_Detour(int edx) {
+/*bool __fastcall GSetup__LoadMapScript_Detour(int edx) {
 	TRACE("reading map...");
 	return GSetup__LoadMapScript();
-}
+}*/
 
 void processWindowOptions() {
 	HWND consoleWindow = GetConsoleWindow();
@@ -2855,6 +2926,10 @@ void processWindowOptions() {
 	bool windowtop = getArgFlag(argv, argc, "/windowtop");
 	if (windowtop) {
 		SetWindowPos(gameWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+	}
+	char* consolepos = getArgVal(argv, argc, "/consolepos");
+	if (consolepos != NULL && consoleWindow != NULL) {
+		setWindowPos(consoleWindow, consolepos);
 	}
 }
 
@@ -2880,9 +2955,9 @@ void init_mods() {
 	DetourUpdateThread(GetCurrentThread());
 
 	DETOUR(GGame__LoadScriptLibrary, GGame__LoadScriptLibrary_Detour);
-	DETOUR(GGame__ClearMap, GGame__ClearMap_Detour);
-	DETOUR(GGame__StartGame, GGame__StartGame_Detour);
-	DETOUR(GGame__Loop, GGame__Loop_Detour);
+	//DETOUR(GGame__ClearMap, GGame__ClearMap_Detour);
+	//DETOUR(GGame__StartGame, GGame__StartGame_Detour);
+	//DETOUR(GGame__Loop, GGame__Loop_Detour);
 	DETOUR(PauseGame, PauseGame_Detour);
 	//DETOUR(BWCheckFeatureIsEnabled, BWCheckFeatureIsEnabled_Detour);
 	DETOUR(GGame__Init, GGame__Init_Detour);

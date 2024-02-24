@@ -195,3 +195,7 @@ std::unordered_map<std::string, std::string> subtypesMap = {
 	{"AUDIO_SFX_BANK_TYPE_HELP_SPRITES", "HELP_TEXT"},
 	{"AUDIO_SFX_BANK_TYPE_SPELL", "LH_SCRIPT_SAMPLE"}
 };
+
+std::unordered_map<std::string, std::list<std::string>> TypeProperties = {
+	{"SCRIPT_OBJECT_TYPE_MARKER", {"SCRIPT_OBJECT_PROPERTY_TYPE_XPOS", "SCRIPT_OBJECT_PROPERTY_TYPE_YPOS", "SCRIPT_OBJECT_PROPERTY_TYPE_ZPOS"}}
+};

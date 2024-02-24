@@ -38,7 +38,7 @@ class Gdb : public Debugger {
 
 		static std::list<std::string> commandQueue;
 
-		static Breakpoint* lastHitBreakpoint;
+		static LineBreakpoint* lastHitBreakpoint;
 
 		static char lastPrintedFile[256];
 		static int firstPrintedLine;
@@ -133,9 +133,6 @@ class Gdb : public Debugger {
 		}
 
 		void threadEnded(void* pThread, TaskInfo* info) {
-			if (pThread == catchThread) {
-				catchThread = NULL;
-			}
 			if (info->id == compiledThreadId) {
 				if (deleteScriptByName("_gdb_expr_")) {
 					unsetSource("__debugger_compile");
@@ -156,7 +153,7 @@ class Gdb : public Debugger {
 			}
 		}
 
-		void breakpointHit(Task* task, Breakpoint* breakpoint) {
+		void onBreakpoint(Task* task, LineBreakpoint* breakpoint) {
 			lastHitBreakpoint = breakpoint;
 			char args[512];
 			formatTaskParameters(task, args);
@@ -174,12 +171,25 @@ class Gdb : public Debugger {
 			readAndExecuteCommand(task);
 		}
 
-		void onCatchpoint(Task* task, int event) {
+		void onCatchpoint(Task* task, Breakpoint* catchpoints[], size_t count) {
 			Instruction* instr = getCurrentInstruction(task);
-			if (event == EV_SYSCALL) {
-				printf("Catchpoint (call to syscall '%s')\n", NativeFunctionNames[instr->intVal]);
-			} else if (event == EV_SYSCALL_RET) {
-				printf("Catchpoint (returned from syscall '%s')\n", NativeFunctionNames[instr->intVal]);
+			for (size_t i = 0; i < count; i++) {
+				Breakpoint* breakpoint = catchpoints[i];
+				if (breakpoint->getType() == BreakpointType::WATCH) {
+					Watch* watch = (Watch*)breakpoint;
+					printf("Old value = %f\n", watch->oldValue);
+					printf("New value = %f\n", watch->newValue);
+					printf("Watchpoint: %s\n", watch->getCondition()->str.c_str());
+				} else if (breakpoint->getType() == BreakpointType::SYSCALL) {
+					SyscallCatchpoint* catchpoint = (SyscallCatchpoint*)breakpoint;
+					printf("Catchpoint (call to syscall '%s')\n", catchpoint->getSyscallName());
+				} else if (breakpoint->getType() == BreakpointType::CALL) {
+					CallCatchpoint* catchpoint = (CallCatchpoint*)breakpoint;
+					printf("Catchpoint (call to script '%s')\n", catchpoint->getScript().c_str());
+				} else if (breakpoint->getType() == BreakpointType::RUN) {
+					RunCatchpoint* catchpoint = (RunCatchpoint*)breakpoint;
+					printf("Catchpoint (start background script '%s')\n", catchpoint->getScript().c_str());
+				}
 			}
 			printDisplays(task);
 			printCurrentLine(task);
@@ -187,11 +197,15 @@ class Gdb : public Debugger {
 		}
 
 		void beforeInstruction(Task* task) {
-			printCurrentInstruction(task);
+			if (breakAfterInstructions > 0 && steppingThread != NULL && getThread(task) == steppingThread) {
+				printCurrentInstruction(task);
+			}
 		}
 
 		void beforeLine(Task* task) {
-			printCurrentLine(task);
+			if (breakAfterLines > 0 && steppingThread != NULL && getThread(task) == steppingThread) {
+				printCurrentLine(task);
+			}
 		}
 
 		void onPauseBeforeInstruction(Task* task) {
@@ -213,20 +227,6 @@ class Gdb : public Debugger {
 				lastPrintedLineTask = task;
 				lastPrintedLineIp = task->ip;
 			}
-			readAndExecuteCommand(task);
-		}
-
-		void onException(Task* task, bool exception, std::list<Watch*> watches) {
-			for (Watch* watch : watches) {
-				printf("Old value = %f\n", watch->oldValue);
-				printf("New value = %f\n", watch->newValue);
-				printf("Watchpoint: %s\n", watch->getExpression()->str.c_str());
-			}
-			if (exception) {
-				printf("Exception in Thread %i\n", catchThread->taskNumber);
-			}
-			printDisplays(task);
-			printCurrentLine(task);
 			readAndExecuteCommand(task);
 		}
 
@@ -325,7 +325,7 @@ class Gdb : public Debugger {
 							} else if (expr->datatype == DT_BOOLEAN) {
 								printf("%i: %s = %s\n", i, display->expression.c_str(), val->floatVal != 0.0f ? "true" : "false");
 							} else if (expr->datatype == DT_COORDS) {
-								printf("%i: %s = [%f, %f, %f]\n", i, display->expression.c_str(),
+								printf("%i: %s = {%f, %f, %f}\n", i, display->expression.c_str(),
 										val[0].floatVal, val[1].floatVal, val[2].floatVal);
 							}
 						}
@@ -554,9 +554,7 @@ class Gdb : public Debugger {
 					printf("%s%i%s", prefix, (int)result->floatVal, suffix);
 				} else if (datatype == DT_BOOLEAN) {
 					printf("%s%s%s", prefix, result->floatVal != 0.0f ? "true" : "false", suffix);
-				} else if (datatype == DT_COORDS) {
-					printf("%s[%f, %f, %f]%s", prefix, result[0].floatVal, result[1].floatVal, result[2].floatVal, suffix);
-				} else if (datatype == DT_ARRAY) {
+				} else if (datatype == DT_ARRAY || datatype == DT_COORDS) {
 					const int count = getVarSize(currentFrame, result);
 					printf("%s{%f", prefix, result->floatVal);
 					result++;
@@ -886,7 +884,7 @@ class Gdb : public Debugger {
 				}
 			}
 			if (file != NULL && line > 0 && ip >= 0) {
-				Breakpoint* breakpoint = setBreakpoint(file, line, ip, thread, sCondition);
+				LineBreakpoint* breakpoint = setLineBreakpoint(file, line, ip, thread, sCondition);
 				if (breakpoint != NULL) {
 					breakpoint->temporary = temporary;
 					printf("Breakpoint at %i from %s (%i)\n", line, file, ip);
@@ -948,25 +946,31 @@ class Gdb : public Debugger {
 
 		static bool c_catch(char* rawBuffer, int argc, const char* cmd) {
 			if (argc < 2) {
-				catchThread = NULL;
-				printf("Exception catching disabled\n");
+				printf("Missing arguments\n");
 			} else {
 				const char* arg = argv[1];
-				if (streq(arg, "exception")) {
-					if (currentFrame == NULL) {
-						printf("No active task.\n");
-						return false;
-					}
-					catchThread = getThread(currentFrame);
-					printf("Exception catching enabled for current thread\n");
-				} else if (streq(arg, "syscall")) {
+				if (streq(arg, "syscall")) {
 					if (argc > 2) {
 						for (int j = 2; j < argc; j++) {
 							arg = argv[j];
 							for (int i = 0; i < NATIVE_COUNT; i++) {
 								if (_stricmp(arg, NativeFunctionNames[i]) == 0) {
-									catchSysCalls[i] = ENABLED;
+									setSyscallCatchpoint(i);
 								}
+							}
+						}
+					} else {
+						printf("Missing argument.\n");
+					}
+				} else if (streq(arg, "call")) {
+					if (argc > 2) {
+						for (int j = 2; j < argc; j++) {
+							arg = argv[j];
+							Script* script = getScriptByName(arg);
+							if (script == NULL) {
+								printf("Script '%s' does not exist.\n", arg);
+							} else {
+								setCallCatchpoint(arg);
 							}
 						}
 					} else {
@@ -980,7 +984,7 @@ class Gdb : public Debugger {
 							if (script == NULL) {
 								printf("Script '%s' does not exist.\n", arg);
 							} else {
-								catchRunScripts.insert(arg);
+								setRunCatchpoint(arg);
 							}
 						}
 					} else {
@@ -1032,7 +1036,7 @@ class Gdb : public Debugger {
 					}
 				}
 			}
-			Breakpoint* breakpoint = getBreakpointAtAddress(ip);
+			LineBreakpoint* breakpoint = getBreakpointAtAddress(ip);
 			if (breakpoint != NULL) {
 				unsetBreakpoint(breakpoint);
 				printf("Breakpoint removed\n");
@@ -1247,45 +1251,13 @@ class Gdb : public Debugger {
 					delete display;
 				}
 			} else {
+				auto breakpoints = getBreakpoints();
 				int index = atoi(argv[1]) - 1;
-				if (index < 0) {
+				if (index < 0 || index >= (int)breakpoints.size()) {
 					printf("Invalid index\n");
 					return false;
 				}
-				auto breakpoints = getBreakpoints();
-				if (index < (int)breakpoints.size()) {
-					Breakpoint* breakpoint = getBreakpointByIndex(index);
-					unsetBreakpoint(breakpoint);
-				} else {
-					index -= breakpoints.size();
-					auto watches = getWatches();
-					if (index < (int)watches.size()) {
-						Watch* watch = getWatchByIndex(index);
-						deleteWatch(watch);
-					} else {
-						index -= watches.size();
-						if (catchThread != NULL && index-- == 0) {
-							catchThread = NULL;
-						} else {
-							for (int i = 0; i < NATIVE_COUNT; i++) {
-								if (catchSysCalls[i]) {
-									if (index-- == 0) {
-										catchSysCalls[i] = NOT_SET;
-										return false;
-									}
-								}
-							}
-							if (index < (int)catchRunScripts.size()) {
-								auto it = catchRunScripts.begin();
-								std::advance(it, index);
-								catchRunScripts.erase(it);
-							} else {
-								index -= catchRunScripts.size();
-								printf("Breakpoint not found\n");
-							}
-						}
-					}
-				}
+				unsetBreakpoint(breakpoints[index]);
 			}
 			return false;
 		}
@@ -1413,43 +1385,14 @@ class Gdb : public Debugger {
 					display->enabled = false;
 				}
 			} else {
+				auto breakpoints = getBreakpoints();
 				int index = atoi(argv[argc - 1]) - 1;
-				if (index < 0) {
+				if (index < 0 || index >= (int)breakpoints.size()) {
 					printf("Invalid index\n");
 					return false;
 				}
-				auto breakpoints = getBreakpoints();
-				if (index < (int)breakpoints.size()) {
-					Breakpoint* breakpoint = getBreakpointByIndex(index);
-					breakpoint->setEnabled(false);
-				} else {
-					index -= breakpoints.size();
-					auto watches = getWatches();
-					if (index < (int)watches.size()) {
-						Watch* watch = getWatchByIndex(index);
-						watch->setEnabled(false);
-					} else {
-						index -= watches.size();
-						if (catchThread != NULL && index-- == 0) {
-							printf("Catchpoint for exceptions can't be disabled, please use delete command.\n");
-						} else {
-							for (int i = 0; i < NATIVE_COUNT; i++) {
-								if (catchSysCalls[i]) {
-									if (index-- == 0) {
-										catchSysCalls[i] = DISABLED;
-										return false;
-									}
-								}
-							}
-							if (index < (int)catchRunScripts.size()) {
-								printf("Catchpoint for run can't be disabled, please use delete command.\n");
-							} else {
-								index -= catchRunScripts.size();
-								printf("Breakpoint not found\n");
-							}
-						}
-					}
-				}
+				Breakpoint* breakpoint = breakpoints[index];
+				breakpoint->setEnabled(false);
 			}
 			return false;
 		}
@@ -1537,50 +1480,21 @@ class Gdb : public Debugger {
 					display->enabled = true;
 				}
 			} else {
+				auto breakpoints = getBreakpoints();
 				bool once = getArgFlag(argv, argc, "once");
 				bool deleteOnHit = getArgFlag(argv, argc, "del");
 				int index = atoi(argv[argc - 1]) - 1;
-				if (index < 0) {
+				if (index < 0 || index >= (int)breakpoints.size()) {
 					printf("Invalid index\n");
 					return false;
 				}
-				auto breakpoints = getBreakpoints();
-				if (index < (int)breakpoints.size()) {
-					Breakpoint* breakpoint = getBreakpointByIndex(index);
-					breakpoint->setEnabled(true);
-					if (once) {
-						breakpoint->targetHitCount = 1;
-					}
-					if (deleteOnHit) {
-						breakpoint->deleteOnHit = true;
-					}
-				} else {
-					index -= breakpoints.size();
-					auto watches = getWatches();
-					if (index < (int)watches.size()) {
-						Watch* watch = getWatchByIndex(index);
-						watch->setEnabled(true);
-					} else {
-						index -= watches.size();
-						if (catchThread != NULL && index-- == 0) {
-							//can't be disabled, just deleted
-						} else {
-							for (int i = 0; i < NATIVE_COUNT; i++) {
-								if (catchSysCalls[i]) {
-									if (index-- == 0) {
-										catchSysCalls[i] = ENABLED;
-										return false;
-									}
-								}
-							}
-							if (index < (int)catchRunScripts.size()) {
-								//can't be disabled, just deleted
-							} else {
-								index -= catchRunScripts.size();
-								printf("Breakpoint not found\n");
-							}
-						}
-					}
+				Breakpoint* breakpoint = breakpoints[index];
+				breakpoint->setEnabled(true);
+				if (once) {
+					breakpoint->targetHitCount = 1;
+				}
+				if (deleteOnHit) {
+					breakpoint->deleteOnHit = true;
 				}
 			}
 			return false;
@@ -1791,29 +1705,28 @@ class Gdb : public Debugger {
 			int index = 1;
 			for (Breakpoint* breakpoint : getBreakpoints()) {
 				const char* enabled = breakpoint->isEnabled() ? "enabled" : "disabled";
-				printf("%5i breakpoint %-8s %8i %s:%i\n", index++, enabled, breakpoint->ip,
-					breakpoint->filename.c_str(), breakpoint->lineno);
-			}
-			for (Watch* watch : getWatches()) {
-				const char* enabled = watch->isEnabled() ? "enabled" : "disabled";
-				if (watch->task == NULL) {
-					printf("%5i watchpoint %-8s %8i %s\n", index++, enabled, 0, watch->getExpression()->str.c_str());
-				} else {
-					printf("%5i watchpoint %-8s %8i %s (Task %i)\n", index++, enabled, 0,
-						watch->getExpression()->str.c_str(), watch->task->taskNumber);
+				if (breakpoint->getType() == BreakpointType::LINE) {
+					LineBreakpoint* bp = (LineBreakpoint*)breakpoint;
+					printf("%5i breakpoint %-8s %8i %s:%i\n", index++, enabled, bp->ip,
+						bp->filename.c_str(), bp->lineno);
+				} else if (breakpoint->getType() == BreakpointType::WATCH) {
+					Watch* watch = (Watch*)breakpoint;
+					if (watch->task == NULL) {
+						printf("%5i watchpoint %-8s %8i %s\n", index++, enabled, 0, watch->getCondition()->str.c_str());
+					} else {
+						printf("%5i watchpoint %-8s %8i %s (Task %i)\n", index++, enabled, 0,
+							watch->getCondition()->str.c_str(), watch->task->taskNumber);
+					}
+				} else if (breakpoint->getType() == BreakpointType::SYSCALL) {
+					SyscallCatchpoint* catchpoint = (SyscallCatchpoint*)breakpoint;
+					printf("%5i catchpoint %-8s %8i %s\n", index++, enabled, 0, catchpoint->getSyscallName());
+				} else if (breakpoint->getType() == BreakpointType::CALL) {
+					CallCatchpoint* catchpoint = (CallCatchpoint*)breakpoint;
+					printf("%5i catchpoint %-8s %8i %s %s\n", index++, "enabled", 0, "call", catchpoint->getScript().c_str());
+				} else if (breakpoint->getType() == BreakpointType::RUN) {
+					RunCatchpoint* catchpoint = (RunCatchpoint*)breakpoint;
+					printf("%5i catchpoint %-8s %8i %s %s\n", index++, "enabled", 0, "start", catchpoint->getScript().c_str());
 				}
-			}
-			if (catchThread != NULL) {
-				printf("%5i catchpoint %-8s %8i %s (Thread %i)\n", index++, "enabled", 0, "exception", catchThread->taskNumber);
-			}
-			for (int i = 0; i < NATIVE_COUNT; i++) {
-				if (catchSysCalls[i]) {
-					const char* enabled = catchSysCalls[i] == ENABLED ? "enabled" : "disabled";
-					printf("%5i catchpoint %-8s %8i %s\n", index++, enabled, 0, NativeFunctionNames[i]);
-				}
-			}
-			for (std::string name : catchRunScripts) {
-				printf("%5i catchpoint %-8s %8i %s %s\n", index++, "enabled", 0, "run", name.c_str());
 			}
 			return false;
 		}
@@ -3023,7 +2936,7 @@ char* Gdb::argv[MAX_ARGS];
 
 std::list<std::string> Gdb::commandQueue = std::list<std::string>();
 
-Breakpoint* Gdb::lastHitBreakpoint;
+LineBreakpoint* Gdb::lastHitBreakpoint;
 
 char Gdb::lastPrintedFile[256];
 int Gdb::firstPrintedLine = 0;
