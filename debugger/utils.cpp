@@ -258,6 +258,7 @@ int rejoinArgs(char** argv, int argc, const char* startArg, const char* endArg) 
 int splitArgs(char* str, char sep, char** dst, int limit) {
     int n = 0, i = 0;
     bool quote = false;
+    bool escape = false;
     dst[n++] = str;
     if (n >= limit) return n;
     bool isQuote = false;

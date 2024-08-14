@@ -47,7 +47,7 @@ std::map<int, Breakpoint*> allBreakpoints;
 std::unordered_map<int, LineBreakpoint*> lineBreakpoints;
 std::list<Watch*> watches;
 DWORD lastBreakLine;
-DWORD lastStepLine;
+//DWORD lastStepLine;
 Task* steppingThread = NULL;
 SyscallCatchpoint* catchSysCalls[NATIVE_COUNT];
 std::map<std::string, CallCatchpoint*> catchCallScripts;
@@ -73,7 +73,7 @@ MemoryManager memoryManager;
 
 std::unordered_map<int, std::unordered_map<std::string, Expression*>> expressionsCache;
 size_t unusedExpressionsSize = 0;
-constexpr auto MAX_UNUSED_EXPRESSIONS_BYTES = 4096;
+constexpr auto MAX_UNUSED_EXPRESSIONS_BYTES = 1024 * 1024;
 
 ErrorCallback originalErrCallback = NULL;
 std::stack<ParserMessages*> parseMessagesTraps;
@@ -692,7 +692,7 @@ Var* getVarById(Task* task, int id) {
 	if (task != NULL && id > (int)task->globalsCount) {
 		const int lIndex = id - 1 - task->globalsCount;
 		if (lIndex >= task->localVars.pEnd - task->localVars.pFirst) {
-			ERR("invalid local variable id %i in %s", id, task->name);
+			//ERR("invalid local variable id %i in %s", id, task->name);
 			return NULL;
 		}
 		Var* var = task->localVars.pFirst + lIndex;
@@ -943,6 +943,8 @@ void cleanup() {
 		delete taskInfo;
 	}
 	tasksInfo.clear();
+	expressionsCache.clear();
+	memoryManager.clear();
 }
 
 void onChlLoaded() {
@@ -1006,9 +1008,13 @@ int ScriptLibraryR_RestoreState(int a1, char* FileName) {
 	//Build threads list
 	for (TaskEntry* entry = ScriptLibraryR.pTaskList->pFirst; entry != NULL; entry = entry->next) {
 		Task* task = entry->task;
+		TaskInfo* info = tasksInfo[task->taskNumber];
 		if (!tasksParents.contains(task->taskNumber)) {
 			threads[task->taskNumber] = task;
-			debugger->threadResumed(task);
+			info->thread = info;
+			debugger->threadRestored(task);
+		} else {
+			info->thread = tasksInfo[getThread(task)->taskNumber];
 		}
 	}
 	//
@@ -1028,7 +1034,11 @@ int ScriptLibraryR_StartScript(int a1, const char* scriptName, int allowedScript
 	return r;
 }
 
-void debugger_execute_pre(Task* task) {
+TaskInfo* getTaskInfo(Task* task) {
+	return tasksInfo[task->taskNumber];
+}
+
+void debugger_execute_pre(Task* task, TaskInfo* info) {
 	Instruction* instruction = getCurrentInstruction(task);
 	debugger->beforeInstruction(task);
 	if (pause) {
@@ -1063,7 +1073,7 @@ void debugger_execute_pre(Task* task) {
 		}
 	} else if (breakFromAddress < 0x7FFFFFFF) {
 		if (task->ip >= breakFromAddress && (steppingThread == NULL || getThread(task) == steppingThread)
-			&& (!task->inExceptionHandler || tasksInfo[task->taskNumber]->exceptionMatched)) {
+			&& (!task->inExceptionHandler || info->exceptionMatched)) {
 			if (getFrameDepth(task) <= stepInMaxDepth) {
 				breakFromAddress = 0x7FFFFFFF;
 				if (breakAfterLines == 0) {
@@ -1073,7 +1083,7 @@ void debugger_execute_pre(Task* task) {
 			}
 		}
 	} else if (breakAfterInstructions > 0 && (steppingThread == NULL || getThread(task) == steppingThread)
-		&& (!task->inExceptionHandler || tasksInfo[task->taskNumber]->exceptionMatched)) {
+		&& (!task->inExceptionHandler || info->exceptionMatched)) {
 		if (getFrameDepth(task) <= stepInMaxDepth) {
 			if (--breakAfterInstructions == 0) {
 				lastBreakLine = instruction->linenumber;
@@ -1081,8 +1091,8 @@ void debugger_execute_pre(Task* task) {
 			}
 		}
 	} else if (breakAfterLines > 0 && (steppingThread == NULL || getThread(task) == steppingThread)
-		&& (!task->inExceptionHandler || tasksInfo[task->taskNumber]->exceptionMatched)) {
-		if (instruction->linenumber != lastStepLine /*|| instruction->opcode == JMP*/ || instruction->opcode == JZ) {
+		&& (!task->inExceptionHandler || info->exceptionMatched)) {
+		if (instruction->linenumber != info->lastStepLine /*|| instruction->opcode == JMP || instruction->opcode == JZ*/) {
 			if (getFrameDepth(task) <= stepInMaxDepth) {
 				if (--breakAfterLines == 0) {
 					lastBreakLine = instruction->linenumber;
@@ -1098,20 +1108,19 @@ void debugger_execute_pre(Task* task) {
 	} else if (instruction->opcode == Opcodes::CALL && catchRunScripts.contains(getScriptById(instruction->intVal)->name)) {
 		debugger->onCatchpoint(task, (Breakpoint**)&catchRunScripts[getScriptById(instruction->intVal)->name], 1);
 	}
-	lastStepLine = instruction->linenumber;
 }
 
-void debugger_execute_post(Task* task) {
+void debugger_execute_post(Task* task, TaskInfo* info) {
 	bool exception = false;
 	Instruction* instruction = getCurrentInstruction(task);
 	if (task->inExceptionHandler) {
-		if (instruction->opcode == JZ && !tasksInfo[task->taskNumber]->exceptionMatched) {
+		if (instruction->opcode == JZ && !info->exceptionMatched) {
 			bool cond = task->stack.intVals[task->stack.count] != 0;	//The condition has been popped but the value is still on the stack
 			if (cond) {
 				//We can catch exceptions here
 			}
 		} else if (instruction->opcode == ITEREXCEPT || instruction->opcode == ENDEXCEPT || instruction->opcode == BRKEXCEPT) {
-			tasksInfo[task->taskNumber]->exceptionMatched = false;
+			info->exceptionMatched = false;
 		}
 	}
 	//
@@ -1141,10 +1150,34 @@ void debugger_execute_post(Task* task) {
 	}
 }
 
+bool checkSuspend(Task* task, TaskInfo* info) {
+	if (info->thread->suspend) {
+		if (!info->thread->suspended) {
+			info->lastStepLine = getCurrentInstruction(task)->linenumber;
+			info->currentIp = task->ip;
+			info->thread->suspended = true;
+			debugger->threadPaused(threads[info->id]);
+		}
+		return true;
+	} else {
+		info->currentIp = task->ip;
+		if (info->thread->suspended) {
+			info->thread->suspended = false;
+			debugger->threadResumed(threads[info->id]);
+		}
+		return false;
+	}
+}
+
 char __cdecl ScriptLibraryR_lhvmCpuLoop(Task* task) {	//at 0x8DA0
 	Task*& currentTask = *ScriptLibraryR.ppCurrentTask;
 	DWORD& scriptInstructionCount = *ScriptLibraryR.pScriptInstructionCount;
 	//
+	debugger->taskPoll(task);
+	TaskInfo* info = tasksInfo[task->taskNumber];
+	if (info == NULL || checkSuspend(task, info)) {
+		return 0;
+	}
 	if (allowedThreadId != 0 && getThread(task)->taskNumber != allowedThreadId) {
 		return 0;
 	}
@@ -1154,7 +1187,10 @@ char __cdecl ScriptLibraryR_lhvmCpuLoop(Task* task) {	//at 0x8DA0
 	if (!task->waitingTask) {
 		do {
 			currentTask = task;
-			debugger_execute_pre(task);		//hook in
+			debugger_execute_pre(task, info);		//hook in
+			if (checkSuspend(task, info)) {
+				break;
+			}
 			if (allowedThreadId != 0 && getThread(task)->taskNumber != allowedThreadId) {
 				break;
 			}
@@ -1165,7 +1201,7 @@ char __cdecl ScriptLibraryR_lhvmCpuLoop(Task* task) {	//at 0x8DA0
 			Instruction& instruction = ScriptLibraryR.instructions->pFirst[task->ip];
 			OpcodeImpl opcodeImpl = ScriptLibraryR.opcodesImpl[instruction.opcode];
 			opcodeImpl(currentTask, &instruction);
-			debugger_execute_post(task);	//hook out
+			debugger_execute_post(task, info);	//hook out
 			if (*ScriptLibraryR.ppCurrentStack == ScriptLibraryR.pMainStack) {
 				break;						//Task is dead
 			}
@@ -1790,7 +1826,10 @@ int addLocalVar(Task* task, const char* name, float value, size_t size) {
 Var* evalExpression(Task* context, Expression* expr) {
 	TRACE("evaluating expression '%s' at address %i", expr->str.c_str(), expr->instructionAddress);
 	if (expr->varId >= 0) {
-		return getVarById(context, expr->varId);
+		if (context == NULL || (int)context->globalsCount >= expr->globalsCount) {
+			return getVarById(context, expr->varId);
+		}
+		return NULL;
 	}
 	Task evalTask;
 	evalTask.currentExceptionHandlerIndex = 0;
@@ -1801,7 +1840,13 @@ Var* evalExpression(Task* context, Expression* expr) {
 	evalTask.inExceptionHandler = 0;
 	evalTask.instructionAddress = expr->instructionAddress;
 	evalTask.ip = expr->instructionAddress;
-	evalTask.localVars = context->localVars;
+	if (context != NULL) {
+		evalTask.localVars = context->localVars;
+	} else {
+		evalTask.localVars.pFirst = NULL;
+		evalTask.localVars.pEnd = NULL;
+		evalTask.localVars.pBufferEnd = NULL;
+	}
 	evalTask.name = (char*)"__debugger";
 	evalTask.prevIp = expr->instructionAddress;
 	evalTask.scriptID = -1;
@@ -2364,6 +2409,14 @@ bool updateCHL(const char* filename, bool stopAllInChangedFiles) {
 	return true;
 }
 
+void suspendThread(int threadId) {
+	tasksInfo[threadId]->suspend = true;
+}
+
+void resumeThread(int threadId) {
+	tasksInfo[threadId]->suspend = false;
+}
+
 std::vector<Breakpoint*> getBreakpoints() {
 	auto res = std::vector<Breakpoint*>();
 	res.reserve(allBreakpoints.size());
@@ -2616,8 +2669,11 @@ DWORD __cdecl ScriptLibraryR_doStartScript(Script* pScript) {
 	if (caller != NULL) {
 		tasksParents[newTaskId] = caller;
 		caller = NULL;
+		Task* thread = getThread(task);
+		info->thread = tasksInfo[thread->taskNumber];
 	} else {
 		threads[newTaskId] = task;
+		info->thread = info;
 		debugger->threadStarted(task);
 	}
 	return newTaskId;
@@ -2857,7 +2913,7 @@ void initScriptLibraryR() {
 						rSubtypes[val] = name->bytes;
 					}
 				}
-				TRACE("%s -> %s", sType, sSubtype);
+				TRACE("%s -> %s", sType.c_str(), sSubtype.c_str());
 			}
 		} else {
 			Fail("ERROR: this debugger.dll can work only with LHVM 8 (Black & White: Creature Isle runtime)");
@@ -2981,10 +3037,10 @@ void printInfo() {
 	supportedEngines[enginesCount++] = "gdb";
 #endif
 #ifdef DEBUGGER_XDEBUG
-	supportedEngines[enginesCount++] = "xdebug";
+	supportedEngines[enginesCount++] = "xdebug (experimental)";
 #endif
 	printf("\nBlack & White: Creature Isle debugger by Daniels118\n");
-	printf("Version: 0.2 alpha\n");
+	printf("Version: 0.2 alpha 2\n");
 	printf("Supported engines: ");
 	if (enginesCount > 0) {
 		printf("%s", supportedEngines[0]);

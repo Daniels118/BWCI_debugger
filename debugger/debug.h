@@ -68,7 +68,12 @@ class TaskInfo {
 		int id;
 		std::string name;
 		std::vector<Parameter> parameters = std::vector<Parameter>();
+		int lastStepLine = -1;
+		int currentIp = -1;
 		bool exceptionMatched = false;
+		TaskInfo* thread = NULL;
+		bool suspend = false;
+		bool suspended = false;
 
 		TaskInfo(int id, std::string name) {
 			this->id = id;
@@ -105,7 +110,7 @@ class Expression {
 			this->datatype = datatype;
 			this->script = script;
 			this->varId = varId;
-			this->globalsCount = 0;
+			this->globalsCount = script != NULL ? script->globalsCount : varId;
 			this->start = -1;
 			this->instructionAddress = -1;
 			this->instructionsCount = 0;
@@ -378,6 +383,7 @@ int findInstruction(DWORD startIp, DWORD opcode);
 int findInstructionIndex(const char* filename, const int linenumber);
 Instruction* getCurrentInstruction(Task* task);
 Instruction* getInstruction(int ip);
+TaskInfo* getTaskInfo(Task* task);
 
 std::list<Script*> getScripts();
 Script* findScriptByIp(DWORD ip);
@@ -441,6 +447,9 @@ Var* evalExpression(Task* context, Expression* expr);
 Var* evalString(Task* context, std::string expression, int& datatype);
 bool deleteScriptByName(const char* name);
 
+void suspendThread(int threadId);
+void resumeThread(int threadId);
+
 std::vector<Breakpoint*> getBreakpoints();
 Breakpoint* getBreakpointById(int id);
 Breakpoint* getBreakpointByIndex(DWORD index);
@@ -474,6 +483,9 @@ class Debugger {
 		virtual void start() = 0;	//Called every time a CHL has been loaded (when starting new game or loading saved game)
 		virtual void term() = 0;	//Called just once when the program is being closed
 		virtual void threadStarted(Task* task) = 0;
+		virtual void threadRestored(Task* task) = 0;
+		virtual void threadPaused(Task* task) = 0;
+		virtual void taskPoll(Task* task) = 0;
 		virtual void threadResumed(Task* task) = 0;
 		virtual void threadEnded(void* pThread, TaskInfo* info) = 0;
 		virtual void onBreakpoint(Task* task, LineBreakpoint* breakpoint) = 0;

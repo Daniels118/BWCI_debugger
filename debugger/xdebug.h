@@ -14,14 +14,14 @@
 #include <winsock2.h>
 #include <WS2tcpip.h>
 
-// Link with ws2_32.lib
+//Link with ws2_32.lib
 #pragma comment(lib, "Ws2_32.lib")
 
 #undef __FILENAME__
 #undef LOG_LEVEL
 #undef PAUSE_ON
 #define __FILENAME__ "xdebug.h"
-#define LOG_LEVEL 6
+#define LOG_LEVEL 4
 #define PAUSE_ON 0
 #include "logger.h"
 
@@ -149,11 +149,12 @@ private:
 
 public:
 	Task* thread = NULL;
-	XDBG_STATUS status = XDBG_STATUS::STARTING;
+	XDBG_STATUS status = XDBG_STATUS::RUNNING;
 	SOCKET sock = INVALID_SOCKET;
 
 	std::string runCmd = "";
 	int runTrxId = -1;
+	std::string breakData = "";
 
 	int max_depth = 8;
 	int max_children = 15;
@@ -394,8 +395,7 @@ private:
 		} else if (streq(cmd, "stderr")) {
 			c_stderr(cmd, trxId, argv, argc);
 		} else if (streq(cmd, "break")) {
-			status = XDBG_STATUS::BREAK;
-			send_response(cmd, trxId, "", "success=\"1\"");
+			c_break(cmd, trxId, argv, argc);
 		} else if (streq(cmd, "eval")) {
 			c_eval(cmd, trxId, argv, argc);
 		} else if (streq(cmd, "interact")) {
@@ -408,7 +408,7 @@ private:
 	void c_run(char* cmd, int trxId, char** argv, int argc) {
 		runCmd = std::string(cmd);
 		runTrxId = trxId;
-		status = XDBG_STATUS::RUNNING;
+		resumeThread(thread->taskNumber);
 	}
 
 	void c_step_into(char* cmd, int trxId, char** argv, int argc) {
@@ -418,7 +418,7 @@ private:
 		breakAfterLines = 1;
 		steppingThread = thread;
 		stepInMaxDepth = 9999;
-		status = XDBG_STATUS::RUNNING;
+		resumeThread(thread->taskNumber);
 	}
 
 	void c_step_over(char* cmd, int trxId, char** argv, int argc) {
@@ -428,7 +428,7 @@ private:
 		breakAfterLines = 1;
 		steppingThread = thread;
 		stepInMaxDepth = getFrameDepth(getInnermostFrame(thread));
-		status = XDBG_STATUS::RUNNING;
+		resumeThread(thread->taskNumber);
 	}
 
 	void c_step_out(char* cmd, int trxId, char** argv, int argc) {
@@ -438,7 +438,7 @@ private:
 		breakAfterLines = 1;
 		steppingThread = thread;
 		stepInMaxDepth = getFrameDepth(getInnermostFrame(thread)) - 1;
-		status = XDBG_STATUS::RUNNING;
+		resumeThread(thread->taskNumber);
 	}
 
 	void c_stop(char* cmd, int trxId, char** argv, int argc) {
@@ -448,7 +448,7 @@ private:
 	}
 
 	void c_detach(char* cmd, int trxId, char** argv, int argc) {
-		status = XDBG_STATUS::RUNNING;
+		resumeThread(thread->taskNumber);
 		send_response(cmd, trxId, "", "status=\"running\" reason=\"ok\"");
 		detach();
 	}
@@ -473,7 +473,7 @@ private:
 			send_response(cmd, trxId, cdata("CHL,ASM"), "feature_name=\"%s\" supported=\"1\"", name);
 		} else if (streq(name, "breakpoint_types")) {
 			//send_response(cmd, trxId, cdata("line call return exception conditional watch"), "feature_name=\"%s\" supported=\"1\"", name);
-			send_response(cmd, trxId, cdata("line call conditional watch"), "feature_name=\"%s\" supported=\"1\"", name);
+			send_response(cmd, trxId, cdata("line call exception conditional watch"), "feature_name=\"%s\" supported=\"1\"", name);
 		} else if (streq(name, "multiple_sessions")) {
 			send_response(cmd, trxId, cdata("0"), "feature_name=\"%s\" supported=\"1\"", name);
 		} else if (streq(name, "max_children")) {
@@ -627,7 +627,7 @@ private:
 		char* sState = getArgVal(argv, argc, "-s");
 		char* sLineno = getArgVal(argv, argc, "-n");
 		char* sHitValue = getArgVal(argv, argc, "-h");
-		char* cond64 = getArgVal(argv, argc, "-o");
+		char* cond64 = getArgVal(argv, argc, "--");
 		char cond[1024] = {0};
 		Breakpoint* breakpoint = getBreakpointById(id);
 		if (breakpoint != NULL) {
@@ -857,11 +857,13 @@ private:
 			end = lines.size();
 		}
 		std::string code;
-		code.reserve((end - start + 1) * 128);
-		size_t i = start - 1;
-		code += lines[i];
-		for (i++; i < end; i++) {
-			code += "\n" + lines[i];
+		if (!lines.empty()) {
+			code.reserve((end - start + 1) * 128);
+			size_t i = start - 1;
+			code += lines[i];
+			for (i++; i < end; i++) {
+				code += "\n" + lines[i];
+			}
 		}
 		send_response(cmd, trxId, cdata(code), "success=\"1\"");
 	}
@@ -890,6 +892,11 @@ private:
 		} else {
 			send_error(cmd, trxId, XDBG_ERR::INVALID_OPTS, "Invalid mode");
 		}
+	}
+
+	void c_break(char* cmd, int trxId, char** argv, int argc) {
+		suspendThread(thread->taskNumber);
+		send_response(cmd, trxId, "", "success=\"1\"");
 	}
 
 	void c_eval(char* cmd, int trxId, char** argv, int argc) {
@@ -1113,12 +1120,14 @@ private:
 	}
 
 	static std::string formatFrame(Task* frame, int level) {
+		TaskInfo* info = getTaskInfo(frame);
 		std::string file = pathToUrl(findSourceFile(frame->filename));
 		std::string item =
 			"<stack level=\"" + std::to_string(level) + "\" "
 			"type=\"file\" "
 			"filename=\"" + file + "\" "
-			"lineno=\"" + std::to_string(getCurrentInstruction(frame)->linenumber) + "\"/>";
+			"lineno=\"" + std::to_string(getInstruction(info->currentIp)->linenumber) + "\" "
+			"where=\"" + frame->name + "\"/>";
 		return item;
 	}
 
@@ -1212,8 +1221,7 @@ public:
 			InetPton(AF_INET, "127.0.0.1", &addr.sin_addr.s_addr);
 		}
 		//
-		//std::thread socketMonitor = std::thread(monitorSockets);
-		//
+		printf("WARNING: XDebug is an experimental feature\n");
 		printf("Debugging with XDebug on port %i\n", port);
 	}
 
@@ -1229,16 +1237,48 @@ public:
 	}
 
 	void threadStarted(Task* task) {
+		DEBUG("thread %i started", task->taskNumber);
 		debugThreads[task->taskNumber] = DebugThread(task);
-		debugThreads[task->taskNumber].attach(&addr, ideKey, cookie, appid);
+		DebugThread* dbgThread = &debugThreads[task->taskNumber];
+		dbgThread->attach(&addr, ideKey, cookie, appid);
 	}
 
-	void threadResumed(Task* task) {
+	void threadRestored(Task* task) {
+		DEBUG("thread %i restored", task->taskNumber);
 		debugThreads[task->taskNumber] = DebugThread(task);
-		debugThreads[task->taskNumber].attach(&addr, ideKey, cookie, appid);
+		DebugThread* dbgThread = &debugThreads[task->taskNumber];
+		dbgThread->attach(&addr, ideKey, cookie, appid);
+	}
+
+	void threadPaused(Task* thread) {
+		DEBUG("thread %i paused", thread->taskNumber);
+		DebugThread* dbgThread = &debugThreads[thread->taskNumber];
+		dbgThread->status = XDBG_STATUS::BREAK;
+		dbgThread->send_response(dbgThread->runCmd.c_str(), dbgThread->runTrxId, dbgThread->breakData.c_str(), "status=\"break\" reason=\"ok\"");
+		dbgThread->runTrxId = -1;
+		dbgThread->breakData = "";
+	}
+
+	void taskPoll(Task* task) {
+		Task* thread = getThread(task);
+		DebugThread* dbgThread = &debugThreads[thread->taskNumber];
+		while (dbgThread->hasIncomingCommands()) {
+			TRACE("incoming async command for thread %i", thread->taskNumber);
+			dbgThread->readAndExecCmd();
+		}
+		if (dbgThread->status == XDBG_STATUS::STOPPED) {
+			stopThread(thread);
+		}
+	}
+
+	void threadResumed(Task* thread) {
+		DEBUG("thread %i resumed", thread->taskNumber);
+		DebugThread* dbgThread = &debugThreads[thread->taskNumber];
+		dbgThread->status = XDBG_STATUS::RUNNING;
 	}
 
 	void threadEnded(void* pThread, TaskInfo* info) {
+		DEBUG("thread %i ended", info->id);
 		if (debugThreads.contains(info->id)) {
 			debugThreads[info->id].detach();
 			debugThreads.erase(info->id);
@@ -1258,14 +1298,9 @@ public:
 			file = "dbgp:_asm";
 			lineno = task->ip + 1;
 		}
-		//std::string info = "<xdebug:message filename=\"" + file + "\" lineno=\"" + std::to_string(lineno) + "\"/>";
-		std::string info = XDebugFormatter::formatBreakpoint(breakpoint);
-		dbgThread->send_response(dbgThread->runCmd.c_str(), dbgThread->runTrxId, info.c_str(), "status=\"break\" reason=\"ok\"");
-		dbgThread->runTrxId = -1;
-		dbgThread->readAndExecCmds();
-		if (dbgThread->status == XDBG_STATUS::STOPPED) {
-			stopThread(thread);
-		}
+		DEBUG("thread %i hit breakpoint at %s:%i", thread->taskNumber, file.c_str(), lineno);
+		dbgThread->breakData = XDebugFormatter::formatBreakpoint(breakpoint);
+		suspendThread(thread->taskNumber);
 	}
 
 	void onCatchpoint(Task* task, Breakpoint* catchpoints[], size_t count) {
@@ -1282,29 +1317,13 @@ public:
 			file = "dbgp:_asm";
 			lineno = task->ip + 1;
 		}
-		//std::string info = "<xdebug:message filename=\"" + file + "\" lineno=\"" + std::to_string(lineno) + "\"/>";
-		std::string info = XDebugFormatter::formatBreakpoint(breakpoint);
-		dbgThread->send_response(dbgThread->runCmd.c_str(), dbgThread->runTrxId, info.c_str(), "status=\"break\" reason=\"ok\"");
-		dbgThread->runTrxId = -1;
-		dbgThread->readAndExecCmds();
-		if (dbgThread->status == XDBG_STATUS::STOPPED) {
-			stopThread(thread);
-		}
+		DEBUG("thread %i hit catchpoint at %s:%i", thread->taskNumber, file.c_str(), lineno);
+		dbgThread->breakData = XDebugFormatter::formatBreakpoint(breakpoint);
+		suspendThread(thread->taskNumber);
 	}
 
 	void beforeInstruction(Task* task) {
-		Task* thread = getThread(task);
-		DebugThread* dbgThread = &debugThreads[thread->taskNumber];
-		while (dbgThread->hasIncomingCommands()) {
-			DEBUG("incoming async command for thread %i", thread->taskNumber);
-			dbgThread->readAndExecCmd();
-		}
-		if (dbgThread->status == XDBG_STATUS::BREAK) {
-			dbgThread->readAndExecCmds();
-			if (dbgThread->status == XDBG_STATUS::STOPPED) {
-				stopThread(thread);
-			}
-		}
+		
 	}
 
 	void beforeLine(Task* task) {
@@ -1318,29 +1337,18 @@ public:
 	void onPauseBeforeLine(Task* task) {
 		Task* thread = getThread(task);
 		DebugThread* dbgThread = &debugThreads[thread->taskNumber];
-		if (incomingCommands && allowedThreadId == getThread(task)->taskNumber) {
-			dbgThread->readAndExecCmds();
-			incomingCommands = false;
-			allowedThreadId = 0;
+		dbgThread->status = XDBG_STATUS::BREAK;
+		std::string file = findSourceFile(task->filename);
+		int lineno;
+		if (file != "") {
+			file = pathToUrl(file);
+			lineno = getCurrentInstruction(task)->linenumber;
 		} else {
-			dbgThread->status = XDBG_STATUS::BREAK;
-			std::string file = findSourceFile(task->filename);
-			int lineno;
-			if (file != "") {
-				file = pathToUrl(file);
-				lineno = getCurrentInstruction(task)->linenumber;
-			} else {
-				file = "dbgp:_asm";
-				lineno = task->ip + 1;
-			}
-			std::string info = "<xdebug:message filename=\"" + file + "\" lineno=\"" + std::to_string(lineno) + "\"/>";
-			dbgThread->send_response(dbgThread->runCmd.c_str(), dbgThread->runTrxId, info.c_str(), "status=\"break\" reason=\"ok\"");
-			dbgThread->runTrxId = -1;
-			dbgThread->readAndExecCmds();
+			file = "dbgp:_asm";
+			lineno = task->ip + 1;
 		}
-		if (dbgThread->status == XDBG_STATUS::STOPPED) {
-			stopThread(thread);
-		}
+		dbgThread->breakData = "<xdebug:message filename=\"" + file + "\" lineno=\"" + std::to_string(lineno) + "\"/>";
+		suspendThread(thread->taskNumber);
 	}
 
 	void onMessage(DWORD severity, const char* format, ...) {

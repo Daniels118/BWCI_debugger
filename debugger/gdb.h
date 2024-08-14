@@ -126,10 +126,22 @@ class Gdb : public Debugger {
 			}
 		}
 
-		void threadResumed(Task* thread) {
+		void threadRestored(Task* thread) {
 			Task* frame = getInnermostFrame(thread);
 			Instruction* instr = getCurrentInstruction(frame);
 			printf("Thread %i \"%s\" resumed, currently in \"%s\" at %s:%i\n", thread->taskNumber, thread->name, frame->name, frame->filename, instr->linenumber);
+		}
+
+		void threadPaused(Task* thread) {
+			
+		}
+
+		void taskPoll(Task* task) {
+
+		}
+
+		void threadResumed(Task* thread) {
+
 		}
 
 		void threadEnded(void* pThread, TaskInfo* info) {
@@ -190,6 +202,7 @@ class Gdb : public Debugger {
 					RunCatchpoint* catchpoint = (RunCatchpoint*)breakpoint;
 					printf("Catchpoint (start background script '%s')\n", catchpoint->getScript().c_str());
 				}
+				commandQueue.insert(commandQueue.begin(), breakpoint->commands.begin(), breakpoint->commands.end());
 			}
 			printDisplays(task);
 			printCurrentLine(task);
@@ -472,6 +485,10 @@ class Gdb : public Debugger {
 						*dst = '\n';
 					} else if (c == 't') {
 						*dst = '\t';
+					} else if (c == 'q') {
+						*dst = '"';
+					} else if (c == '\\') {
+						*dst = '\\';
 					} else {
 						*dst = c;
 					}
@@ -481,8 +498,18 @@ class Gdb : public Debugger {
 						return -1;
 					}
 					c = *(++src);
-					if (c == 'i' || c == 'f') {
-						int datatype = DT_FLOAT;
+					if (c == 'i' || c == 'f' || c == '.' || c == 'c') {
+						int nDec = -1;
+						if (c == '.') {
+							c = *(++src);
+							nDec = c - '0';
+							c = *(++src);
+							if (c != 'f') {
+								printf("Invalid format specifier.\n");
+								return -1;
+							}
+						}
+						int datatype = c == 'c' ? DT_COORDS : DT_FLOAT;
 						Var* val = evalString(currentFrame, argv[argIndex], datatype);
 						if (val == NULL) {
 							printf("Failed to evaluate '%s'.\n", argv[argIndex]);
@@ -491,7 +518,14 @@ class Gdb : public Debugger {
 						if (c == 'i') {
 							dst += sprintf(dst, "%i", (int)val->floatVal) - 1;
 						} else if (c == 'f') {
-							dst += sprintf(dst, "%f", val->floatVal) - 1;
+							if (nDec <= 0) {
+								dst += sprintf(dst, "%f", val->floatVal) - 1;
+							} else {
+								dst += sprintf(dst, "%.*f", nDec, val->floatVal) - 1;
+							}
+						} else if (c == 'c') {
+							int inoutType = DT_COORDS;
+							dst += sprintf(dst, "[%f, %f, %f]", val[0].floatVal, val[1].floatVal, val[2].floatVal) - 1;
 						}
 					} else {
 						printf("Invalid format specifier.\n");
@@ -2825,6 +2859,7 @@ class Gdb : public Debugger {
 								break;
 							case DT_OBJECT:
 								printf("%2i: %c %u\n", i, datatype_chars[type], currentFrame->stack.uintVals[i]);
+								break;
 							default:
 								printf("%2i: %c %i\n", i, datatype_chars[type], currentFrame->stack.intVals[i]);
 						}
