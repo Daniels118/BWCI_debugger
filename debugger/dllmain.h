@@ -31,6 +31,10 @@ class MemoryManager {
 		std::list<Segment> freeSegments;
 
 	public:
+		void clear() {
+			freeSegments.clear();
+		}
+
 		bool addFreeSpace(const int address, const int size) {
 			if (size <= 0) {
 				TRACE("not adding zero length segment at %i", address);

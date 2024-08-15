@@ -14,12 +14,18 @@
 #define DT_AUTODETECT -1
 #define DT_ARRAY -2
 
-enum CatchEvent {
-	EV_NONE,
-	EV_SYSCALL,
-	EV_SYSCALL_RET,
-	EV_RUN,
-};
+class Breakpoint;
+class LineBreakpoint;
+class Watch;
+class SyscallCatchpoint;
+class CallCatchpoint;
+class RunCatchpoint;
+
+extern std::unordered_map<int, LineBreakpoint*> lineBreakpoints;
+extern std::list<Watch*> watches;
+extern SyscallCatchpoint* catchSysCalls[];
+extern std::map<std::string, CallCatchpoint*> catchCallScripts;
+extern std::map<std::string, RunCatchpoint*> catchRunScripts;
 
 class VarDef {
 	public:
@@ -62,7 +68,12 @@ class TaskInfo {
 		int id;
 		std::string name;
 		std::vector<Parameter> parameters = std::vector<Parameter>();
+		int lastStepLine = -1;
+		int currentIp = -1;
 		bool exceptionMatched = false;
+		TaskInfo* thread = NULL;
+		bool suspend = false;
+		bool suspended = false;
 
 		TaskInfo(int id, std::string name) {
 			this->id = id;
@@ -99,7 +110,7 @@ class Expression {
 			this->datatype = datatype;
 			this->script = script;
 			this->varId = varId;
-			this->globalsCount = 0;
+			this->globalsCount = script != NULL ? script->globalsCount : varId;
 			this->start = -1;
 			this->instructionAddress = -1;
 			this->instructionsCount = 0;
@@ -123,122 +134,244 @@ class Expression {
 
 Var* evalExpression(Task* context, Expression* expr);
 
-class Watch {
-	private:
-		Expression* expression;
-		bool enabled = true;
 
+enum class BreakpointType {
+	LINE, WATCH, SYSCALL, CALL, RUN
+};
+
+
+class Breakpoint {
+private:
+	static int nextId;
+
+	int id;
+	BreakpointType type;
+	Expression* condition = NULL;
+
+protected:
+	bool enabled = false;	//Must be enabled in the child class constructor
+
+public:
+	DWORD targetHitCount = 0;
+	DWORD hits = 0;
+	bool triggerPoint = false;
+	bool disabledByTrigger = false;
+	bool deleteOnHit = false;
+	bool temporary = false;
+
+	std::list<std::string> commands;
+
+	Breakpoint(BreakpointType type) {
+		this->id = nextId++;
+		this->type = type;
+	}
+
+	virtual ~Breakpoint() {
+		this->setCondition(NULL);
+	}
+
+	int getId() {
+		return id;
+	}
+
+	BreakpointType getType() {
+		return type;
+	}
+
+	void setCondition(Expression* expr) {
+		if (this->condition != NULL) {
+			this->condition->refCount--;
+		}
+		this->condition = expr;
+		if (expr != NULL) {
+			expr->refCount++;
+		}
+	}
+
+	Expression* getCondition() {
+		return this->condition;
+	}
+
+	bool isEnabled() {
+		return this->enabled;
+	}
+
+	virtual void setEnabled(bool enabled) = 0;
+};
+
+
+class LineBreakpoint : public Breakpoint {
+public:
+	std::string filename;
+	DWORD lineno;
+	Script* script;
+	DWORD ip;
+	Task* thread = NULL;
+
+	LineBreakpoint(std::string filename, DWORD lineno, Script* script, DWORD ip, Task* thread)
+		: Breakpoint(BreakpointType::LINE) {
+		this->filename = filename;
+		this->lineno = lineno;
+		this->script = script;
+		this->ip = ip;
+		this->thread = thread;
+		this->setEnabled(true);
+	}
+
+	~LineBreakpoint() {
+		this->setEnabled(false);
+	}
+
+	void setEnabled(bool enabled) {
+		if (enabled) {
+			if (!this->enabled) {
+				this->hits = 0;
+				this->enabled = true;
+				this->disabledByTrigger = false;
+				lineBreakpoints[this->ip] = this;
+			}
+		} else {
+			this->enabled = false;
+			lineBreakpoints.erase(this->ip);
+		}
+	}
+};
+
+
+class Watch : public Breakpoint {
 	public:
 		Task* task;
 		float oldValue = 0.0;
 		float newValue = 0.0;
 		bool matched = false;
 
-		Watch(Task* task, Expression* expression) {
+		Watch(Task* task, Expression* expression)
+			: Breakpoint(BreakpointType::WATCH) {
 			this->task = task;
-			this->expression = expression;
-			expression->refCount++;
+			this->setCondition(expression);
+			this->setEnabled(true);
 		}
 
 		~Watch() {
-			expression->refCount--;
-		}
-
-		std::string getKey() {
-			if (task == NULL) {
-				return "{0} " + expression->str;
-			}
-			return "{" + std::to_string(task->taskNumber) + "} ";
-		}
-
-		bool isEnabled() {
-			return this->enabled;
+			this->setEnabled(false);
 		}
 
 		void setEnabled(bool enabled) {
 			if (enabled) {
 				if (!this->enabled) {
 					this->enabled = enabled;
-					Var* val = evalExpression(this->task, this->expression);
+					Var* val = evalExpression(this->task, this->getCondition());
 					if (val != NULL) {
 						this->oldValue = val->floatVal;
 						this->newValue = val->floatVal;
 					}
 					matched = false;
+					watches.push_back(this);
 				}
 			} else {
 				this->enabled = false;
+				watches.remove(this);
 			}
-		}
-
-		Expression* getExpression() {
-			return this->expression;
 		}
 };
 
-class Breakpoint {
-	private:
-		Expression* condition = NULL;
-		bool enabled = true;
 
-	public:
-		std::string filename;
-		DWORD lineno;
-		Script* script;
-		DWORD ip;
-		DWORD targetHitCount = 0;
-		DWORD hits = 0;
-		bool triggerPoint = false;
-		bool disabledByTrigger = false;
-		bool deleteOnHit = false;
-		Task* thread = NULL;
+class SyscallCatchpoint : public Breakpoint {
+private:
+	int syscall = -1;
 
-		std::list<std::string> commands;
+public:
+	SyscallCatchpoint(int syscall)
+		: Breakpoint(BreakpointType::SYSCALL) {
+		this->syscall = syscall;
+		this->setEnabled(true);
+	}
 
-		Breakpoint(std::string filename, DWORD lineno, Script* script, DWORD ip, Task* thread) {
-			this->filename = filename;
-			this->lineno = lineno;
-			this->script = script;
-			this->ip = ip;
-			this->thread = thread;
-		}
+	~SyscallCatchpoint() {
+		this->setEnabled(false);
+	}
 
-		~Breakpoint() {
-			this->setCondition(NULL);
-		}
+	int getSyscall() {
+		return this->syscall;
+	}
 
-		bool isEnabled() {
-			return this->enabled;
-		}
+	const char* getSyscallName() {
+		return NativeFunctionNames[this->syscall];
+	}
 
-		void setEnabled(bool enabled) {
-			if (enabled) {
-				if (!this->enabled) {
-					this->hits = 0;
-					this->enabled = true;
-					this->disabledByTrigger = false;
-				}
-			} else {
-				this->enabled = false;
-			}
-		}
-
-		void setCondition(Expression* expr) {
-			if (this->condition != NULL) {
-				this->condition->refCount--;
-			}
-			this->condition = expr;
-			if (expr != NULL) {
-				expr->refCount++;
-			}
-		}
-
-		Expression* getCondition() {
-			return this->condition;
-		}
+	void setEnabled(bool enabled) {
+		this->enabled = enabled;
+		catchSysCalls[this->syscall] = enabled ? this : NULL;
+	}
 };
+
+class CallCatchpoint : public Breakpoint {
+private:
+	std::string script;
+
+public:
+	CallCatchpoint(std::string script)
+		: Breakpoint(BreakpointType::CALL) {
+		this->script = script;
+		this->setEnabled(true);
+	}
+
+	~CallCatchpoint() {
+		this->setEnabled(false);
+	}
+
+	std::string getScript() {
+		return this->script;
+	}
+
+	void setEnabled(bool enabled) {
+		this->enabled = enabled;
+		if (enabled) {
+			catchCallScripts[script] = this;
+		} else {
+			catchCallScripts.erase(script);
+		}
+	}
+};
+
+class RunCatchpoint : public Breakpoint {
+private:
+	std::string script;
+
+public:
+	RunCatchpoint(std::string script)
+		: Breakpoint(BreakpointType::RUN) {
+		this->script = script;
+		this->setEnabled(true);
+	}
+
+	~RunCatchpoint() {
+		this->setEnabled(false);
+	}
+
+	std::string getScript() {
+		return this->script;
+	}
+
+	void setEnabled(bool enabled) {
+		this->enabled = enabled;
+		if (enabled) {
+			catchRunScripts[script] = this;
+		} else {
+			catchRunScripts.erase(script);
+		}
+	}
+};
+
 
 typedef std::list<std::pair<DWORD, std::string>> ParserMessages;
+
+void getObjectProperty(DWORD objId, int prop, Var* out);
+int getObjectType(DWORD objId);
+int getObjectSubType(DWORD objId);
+const char* getTypeName(int type);
+const char* getSubTypeName(int type, int subType);
+void getObjectPosition(DWORD objId, float coords[]);
 
 const char* findFilenameByIp(DWORD ip);
 
@@ -250,6 +383,7 @@ int findInstruction(DWORD startIp, DWORD opcode);
 int findInstructionIndex(const char* filename, const int linenumber);
 Instruction* getCurrentInstruction(Task* task);
 Instruction* getInstruction(int ip);
+TaskInfo* getTaskInfo(Task* task);
 
 std::list<Script*> getScripts();
 Script* findScriptByIp(DWORD ip);
@@ -282,18 +416,21 @@ int declareGlobalVar(const char* name, size_t size, float value);
 int addLocalVar(Task* task, const char* name, float value, size_t size);
 
 Task* getInnermostFrame(Task* task);
+Task* getFrameAt(Task* task, int depth);
 int getFrameDepth(Task* task);
 std::vector<Task*> getBacktrace(Task* task);
 Task* getParentFrame(Task* frame);
+Task* getParentFrame(Task* task, int depth);
 Task* getChildFrame(Task* frame);
+Task* getChildFrame(Task* task, int depth);
 std::vector<Task*> getThreads();
-Task* getFrame(Task* thread);
 Task* getThread(Task* task);
 Task* getTaskById(int taskId);
 
 void setSource(std::string filename, std::vector<std::string> lines);
 void unsetSource(std::string filename);
 void unsetMissingSources();
+std::string findSourceFile(std::string filename);
 std::vector<std::string> getSource(std::string filename);
 std::string getSourceLine(std::string filename, int lineno);
 std::string getCurrentSourceLine(Task* task);
@@ -310,18 +447,26 @@ Var* evalExpression(Task* context, Expression* expr);
 Var* evalString(Task* context, std::string expression, int& datatype);
 bool deleteScriptByName(const char* name);
 
-std::list<Breakpoint*> getBreakpoints();
-Breakpoint* setBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* thread, const char* condition);
-bool setCondition(Breakpoint* breakpoint, const char* condition);
-bool unsetBreakpoint(Breakpoint* breakpoint);
-Breakpoint* getBreakpointByIndex(DWORD index);
-Breakpoint* getBreakpointAtLine(std::string filename, DWORD line);
-Breakpoint* getBreakpointAtAddress(int ip);
+void suspendThread(int threadId);
+void resumeThread(int threadId);
 
-std::list<Watch*> getWatches();
+std::vector<Breakpoint*> getBreakpoints();
+Breakpoint* getBreakpointById(int id);
+Breakpoint* getBreakpointByIndex(DWORD index);
+bool unsetBreakpoint(Breakpoint* breakpoint);
+
+LineBreakpoint* setLineBreakpoint(std::string filename, DWORD lineno, DWORD ip, Task* thread, const char* condition);
+bool setCondition(Breakpoint* breakpoint, const char* condition);
+LineBreakpoint* getBreakpointAtLine(std::string filename, DWORD line);
+LineBreakpoint* getBreakpointAtAddress(int ip);
 Watch* addWatch(Task* task, const char* expression);
-Watch* getWatchByIndex(DWORD index);
-bool deleteWatch(Watch* watch);
+Watch* getWatchByExpression(Task* task, std::string expr);
+SyscallCatchpoint* setSyscallCatchpoint(int syscall);
+SyscallCatchpoint* getSyscallCatchpoint(int syscall);
+CallCatchpoint* setCallCatchpoint(std::string script);
+CallCatchpoint* getCallCatchpoint(std::string script);
+RunCatchpoint* setRunCatchpoint(std::string script);
+RunCatchpoint* getRunCatchpoint(std::string script);
 
 void jump(Task* task, int ip);
 
@@ -338,24 +483,23 @@ class Debugger {
 		virtual void start() = 0;	//Called every time a CHL has been loaded (when starting new game or loading saved game)
 		virtual void term() = 0;	//Called just once when the program is being closed
 		virtual void threadStarted(Task* task) = 0;
+		virtual void threadRestored(Task* task) = 0;
+		virtual void threadPaused(Task* task) = 0;
+		virtual void taskPoll(Task* task) = 0;
 		virtual void threadResumed(Task* task) = 0;
 		virtual void threadEnded(void* pThread, TaskInfo* info) = 0;
-		virtual void breakpointHit(Task* task, Breakpoint* breakpoint) = 0;
-		virtual void onCatchpoint(Task* task, int event) = 0;
+		virtual void onBreakpoint(Task* task, LineBreakpoint* breakpoint) = 0;
+		virtual void onCatchpoint(Task* task, Breakpoint* catchpoints[], size_t count) = 0;
 		virtual void beforeInstruction(Task* task) = 0;
 		virtual void beforeLine(Task* task) = 0;
 		virtual void onPauseBeforeInstruction(Task* task) = 0;
 		virtual void onPauseBeforeLine(Task* task) = 0;
-		virtual void onException(Task* task, bool exception, std::list<Watch*> watches) = 0;
 		virtual void onMessage(DWORD severity, const char* format, ...) = 0;
 };
 
 extern ScriptLibraryRDll ScriptLibraryR;
 extern std::set<std::string> sourcePath;
 extern Task* steppingThread;
-extern Task* catchThread;
-extern BYTE catchSysCalls[];
-extern std::set<std::string> catchRunScripts;
 extern DWORD breakFromAddress;
 extern int breakAfterLines;
 extern int breakAfterInstructions;
@@ -372,6 +516,7 @@ extern const char* datatype_names[8];
 extern char datatype_chars[8];
 extern const char* vartype_names[4];
 
-constexpr auto NOT_SET = 0;
-constexpr auto ENABLED = 1;
-constexpr auto DISABLED = 2;
+extern std::unordered_map<std::string, int> ScriptObjectTypes;
+extern std::map<std::string, int> ObjectProperties;
+
+extern std::unordered_map<std::string, std::list<std::string>> TypeProperties;

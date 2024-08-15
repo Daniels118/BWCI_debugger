@@ -31,7 +31,7 @@ void assembler_init() {
 		}
 		//Build the mapping between native function names and their IDs
 		for (int i = 0; i < NATIVE_COUNT; i++) {
-			nativeMap[NativeFunctions[i]] = i;
+			nativeMap[NativeFunctionNames[i]] = i;
 		}
 	}
 }
