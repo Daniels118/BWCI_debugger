@@ -21,6 +21,8 @@
 #define PAUSE_ON 0
 #include "logger.h"
 
+using namespace Opcodes;
+
 class CHLFile;
 class CHLHeader;
 class GlobalVariables;
@@ -73,7 +75,7 @@ public:
 class CHLHeader : Struct {
 public:
 	char magic[4] = {'L', 'H', 'V', 'M'};
-	int version = 8;
+	int version = 0;
 
 	int getLength() {
 		return 8;
@@ -88,11 +90,11 @@ public:
 		}
 		n = fread(&version, 4, 1, file);
 		if (n < 1) return false;
-		if (version != 8) {
+		if (version != 7 && version != 8) {
 			ERR("wrong version");
 			return false;
 		}
-		TRACE("LHVM version 8");
+		TRACE("LHVM version %i", version);
 		return true;
 	}
 };
@@ -476,8 +478,10 @@ public:
 			if (!autoStartScripts.read(file)) break;
 			if (!scriptsSection.read(file)) break;
 			if (!data.read(file)) break;
-			if (!taskVars.read(file)) break;
-			if (!initGlobals.read(file)) break;
+			if (header.version == 8) {
+				if (!taskVars.read(file)) break;
+				if (!initGlobals.read(file)) break;
+			}
 			res = true;
 		} while (false);
 		fclose(file);
@@ -842,7 +846,7 @@ bool UScript::operator==(UScript const& other) const {
 					TRACE("instruction %i is a call to a different script ('%s' instead of '%s')", srcAddr, target2.name.c_str(), target1.name.c_str());
 					return false;
 				}
-			} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == 2 || instr1.datatype == DataTypes::DT_VAR)) {
+			} else if ((opcode == PUSH || opcode == POP || opcode == CAST) && (mode == Modes::REFERENCE || instr1.datatype == DataTypes::DT_VAR)) {
 				const int id1 = instr1.datatype == DataTypes::DT_VAR ? (int)instr1.floatVal : instr1.intVal;
 				const int id2 = instr2.datatype == DataTypes::DT_VAR ? (int)instr2.floatVal : instr2.intVal;
 				std::string name1 = this->getVar(id1);
@@ -891,8 +895,8 @@ bool UScript::operator==(UScript const& other) const {
 				Instruction* nInstr1 = it1 + 2;
 				Instruction* nInstr2 = it1 + 2;
 				if (nInstr1 < instructions1.pEnd && nInstr2 < instructions2.pEnd
-						&& nInstr1->opcode == Opcodes::REF_PUSH && nInstr1->mode == 2
-						&& nInstr2->opcode == Opcodes::REF_PUSH && nInstr2->mode == 2) {
+						&& nInstr1->opcode == Opcodes::REF_PUSH && nInstr1->mode == Modes::REFERENCE
+						&& nInstr2->opcode == Opcodes::REF_PUSH && nInstr2->mode == Modes::REFERENCE) {
 					int id1 = (int)it1->floatVal;
 					int id2 = (int)it2->floatVal;
 					std::string name1 = this->getVar(id1);

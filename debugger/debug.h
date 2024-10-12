@@ -296,7 +296,7 @@ public:
 	}
 
 	const char* getSyscallName() {
-		return NativeFunctionNames[this->syscall];
+		return NativeFunctions::NativeFunctionNames[this->syscall];
 	}
 
 	void setEnabled(bool enabled) {
@@ -497,26 +497,19 @@ class Debugger {
 		virtual void onMessage(DWORD severity, const char* format, ...) = 0;
 };
 
-extern ScriptLibraryRDll ScriptLibraryR;
+extern bool asyncMode;
 extern std::set<std::string> sourcePath;
 extern Task* steppingThread;
 extern DWORD breakFromAddress;
 extern int breakAfterLines;
 extern int breakAfterInstructions;
 extern int stepInMaxDepth;
+extern BYTE stepInExceptionHandler;
 extern bool pause;
 extern std::stack<ParserMessages*> parseMessagesTraps;
 extern int allowedThreadId;
 
 extern bool gamePaused;
 
-extern std::map<DWORD, std::string> scriptType_names;
-
-extern const char* datatype_names[8];
-extern char datatype_chars[8];
-extern const char* vartype_names[4];
-
 extern std::unordered_map<std::string, int> ScriptObjectTypes;
 extern std::map<std::string, int> ObjectProperties;
-
-extern std::unordered_map<std::string, std::list<std::string>> TypeProperties;

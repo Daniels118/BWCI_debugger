@@ -21,20 +21,17 @@
     <ClCompile Include="utils.cpp">
       <Filter>File di origine</Filter>
     </ClCompile>
-    <ClCompile Include="resources.cpp">
-      <Filter>File di origine</Filter>
-    </ClCompile>
     <ClCompile Include="assembler.cpp">
       <Filter>File di origine</Filter>
     </ClCompile>
     <ClCompile Include="base64.cpp">
       <Filter>File di origine</Filter>
     </ClCompile>
+    <ClCompile Include="ScriptLibraryR.cpp">
+      <Filter>File di origine</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="bwfuncs.h">
-      <Filter>File di intestazione</Filter>
-    </ClInclude>
     <ClInclude Include="ScriptLibraryR.h">
       <Filter>File di intestazione</Filter>
     </ClInclude>
@@ -73,5 +70,10 @@
     <ResourceCompile Include="Resource.rc">
       <Filter>File di risorse</Filter>
     </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="text1.bin">
+      <Filter>File di risorse</Filter>
+    </None>
   </ItemGroup>
 </Project>

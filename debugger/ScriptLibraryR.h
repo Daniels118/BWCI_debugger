@@ -7,44 +7,85 @@
 
 #include <Windows.h>
 
-#define FUNC(NAME, DEF) union {DEF; FARPROC NAME;}
+struct NATIVE_FUNCTION;
 
-enum Opcodes {
-	END, JZ, PUSH, POP, ADD, SYS, SUB, NEG, MUL, DIV,
-	MOD, NOT, AND, OR, EQ, NEQ, GEQ, LEQ, GT, LT,
-	JMP, SLEEP, EXCEPT, CAST, CALL, ENDEXCEPT, RETEXCEPT, ITEREXCEPT, BRKEXCEPT, SWAP,
-	DUP, LINE, REF_AND_OFFSET_PUSH, REF_AND_OFFSET_POP, REF_PUSH, REF_ADD_PUSH, TAN, SIN, COS, ATAN,
-	ASIN, ACOS, ATAN2, SQRT, ABS
-};
+namespace DataTypes {
+	extern const char* datatype_names[8];
 
-enum DataTypes {
-	DT_NONE, DT_INT, DT_FLOAT, DT_COORDS, DT_OBJECT, DT_UNK5, DT_BOOLEAN, DT_VAR
-};
+	extern const char datatype_chars[8];
 
-enum NativeFunctions {
-	GET_PROPERTY = 18,
-	GET_POSITION = 20,
-	GAME_TYPE = 213,
-	GAME_SUB_TYPE = 214
-};
+	constexpr auto DT_NONE = 0, DT_INT = 1, DT_FLOAT = 2, DT_COORDS = 3, DT_OBJECT = 4, DT_UNK5 = 5, DT_BOOLEAN = 6, DT_VAR = 7;
+} // namespace DataTypes
 
-constexpr int OPCODES_COUNT = 45;
+typedef int Opcode;
 
-extern DWORD opcode_attrs[OPCODES_COUNT];
+namespace Opcodes {
+	constexpr int OPCODES_COUNT_MAX = 45;
 
-constexpr auto OP_ATTR_ARG = 1;
-constexpr auto OP_ATTR_IP = 2 | OP_ATTR_ARG;
-constexpr auto OP_ATTR_SCRIPT = 4 | OP_ATTR_ARG;
-constexpr auto OP_ATTR_JUMP = 8 | OP_ATTR_ARG | OP_ATTR_IP;
-constexpr auto OP_ATTR_FINT = 16;
-constexpr auto OP_ATTR_VSTACK = 32;
+	constexpr auto OP_ATTR_ARG = 1;
+	constexpr auto OP_ATTR_IP = 2 | OP_ATTR_ARG;
+	constexpr auto OP_ATTR_SCRIPT = 4 | OP_ATTR_ARG;
+	constexpr auto OP_ATTR_JUMP = 8 | OP_ATTR_ARG | OP_ATTR_IP;
+	constexpr auto OP_ATTR_FINT = 16;
+	constexpr auto OP_ATTR_VSTACK = 32;
 
-extern std::vector<std::string> opcode_keywords[OPCODES_COUNT][3];
+#ifndef EXCLUDE_EXTERN
+	extern int OPCODES_COUNT;
+	extern std::vector<DWORD> opcode_attrs;
+	extern std::vector<std::vector<std::vector<std::string>>> opcode_keywords;
+	
+	extern Opcode END, JZ, PUSH, POP, ADD, SYS, SUB, NEG, MUL, DIV,
+		MOD, NOT, AND, OR, EQ, NEQ, GEQ, LEQ, GT, LT,
+		JMP, SLEEP, EXCEPT, CAST, CALL, ENDEXCEPT, RETEXCEPT, ITEREXCEPT, BRKEXCEPT, SWAP,
+		DUP, LINE, REF_AND_OFFSET_PUSH, REF_AND_OFFSET_POP, REF_PUSH, REF_ADD_PUSH, TAN, SIN, COS, ATAN,
+		ASIN, ACOS, ATAN2, SQRT, ABS;
 
-extern const char* NativeFunctionNames[];
-constexpr auto NATIVE_COUNT = 528;
+#endif
+} // namespace Opcodes
 
-extern std::unordered_map<std::string, std::string> subtypesMap;
+typedef int Mode;
+
+namespace Modes {
+#ifndef EXCLUDE_EXTERN
+	extern Mode IMMEDIATE;
+	extern Mode REFERENCE;
+
+	extern Mode BACKWARD;
+	extern Mode FORWARD;
+
+	extern Mode SYNC;
+	extern Mode ASYNC;
+
+	extern Mode CAST;
+	extern Mode ZERO;
+
+	extern Mode END_EXCEPT;
+	extern Mode YIELD;
+
+	extern Mode COPY_TO;
+	extern Mode COPY_FROM;
+#endif
+} // namespace Modes
+
+namespace NativeFunctions {
+	constexpr int NATIVE_COUNT_MAX = 528;
+
+#ifndef EXCLUDE_EXTERN
+	extern int NATIVE_COUNT;
+	extern std::vector<const char*> NativeFunctionNames;
+	
+	extern int GET_PROPERTY, GET_POSITION, GAME_TYPE, GAME_SUB_TYPE;
+#endif
+
+	void initNames(NATIVE_FUNCTION* nativeFunctions);
+} // namespace NativeFunctions
+
+namespace ObjectTypes {
+#ifndef EXCLUDE_EXTERN
+	extern std::unordered_map<std::string, std::list<std::string>> TypeProperties;
+	extern std::unordered_map<std::string, std::string> subtypesMap;
+#endif
+} // namespace ObjectTypes
 
 enum VarTypes {
 	VAR_TYPE_REFERENCE = 1,	//?
@@ -221,7 +262,7 @@ struct NATIVE_FUNCTION {
 	DWORD stackIn;
 	DWORD stackOut;
 	DWORD unknown;
-	char name[128];
+	const char name[128];
 };
 
 struct StringObj {
@@ -274,176 +315,118 @@ struct UFILE {	//Fake type for FILEs handled using the statically linked C-runti
 	char*	_tmpfname;
 };
 
-//Instructions to NOP
-#define printParseErrorBeepOffset		0xC392
-#define MessageBeep_size	8
+namespace ScriptLibraryR {
+#ifndef EXCLUDE_EXTERN
+	extern HMODULE hmod;
 
-//DLL statically linked C-runtime functions
-#define operator_new_Offset				0x179B6
-#define freeOffset						0x17F27
-#define _strdupOffset					0x21154
+	extern const char* vartype_names[4];
 
-//DLL functions and fields
-#define loadGameHeadersOffset			0x2B00
-#define createArrayOffset				0x2BF0
-#define getVarTypeOffset				0x4740
-#define setVarTypeOffset				0x5FB0
-#define createVarOffset					0x5690
-#define addStringToDataSectionOffset	0x6470
-#define doStartScriptOffset				0x6550
-#define stopTask0Offset					0x6B80
-#define taskExistsOffset				0x68F0
-#define readTaskOffset					0x8310
-#define lhvmCpuLoopOffset				0x8DA0
-#define addReferenceOffset				0x94A0
-#define removeReferenceOffset			0x94D0
-#define opcode_24_CALL_Offset			0xB4A0
-#define getExceptionHandlersCountOffset	0xB920
-#define getExceptionHandlerCurrentIpOffset 0xB940
-#define parseFileImplOffset				0xEC80
+	extern std::unordered_map<DWORD, std::string> scriptType_names;
 
-#define headersNotLoadedOffset			0x25618
-#define ppCurrentStackOffset			0x2561C
-#define opcodesImplOffset				0x25624
-#define strNotCompiledOffset			0x25A98
-#define	parseFileDefaultInputOffset		0x40E38
-#define enumConstantsOffset				0x44798
-#define pInstructionsOffset				0x447DC
-#define pInstructionsEndOffset			0x447E0
-#define pCurrentTaskExceptStructOffset	0x447E8
-#define mainStackOffset					0x447F8
-#define pTaskListOffset					0x44908
-#define autostartScriptsListOffset		0x44910
-#define globalVarsDeclOffset			0x44920
-#define pGlobalVarsOffset				0x44938
-#define pGlobalVarsEndOffset			0x44940
-#define varTypesListOffset				0x44950
-#define pScriptListOffset				0x44958
-#define pDataSectionOffset				0x44964
-#define dataSectionSizeOffset			0x44968
-#define ticksCountOffset				0x4496C
-#define highestTaskIdOffset				0x44970
-#define highestScriptIdOffset			0x44974
-#define pScriptInstructionCountOffset	0x4497C
-#define ppCurrentTaskOffset				0x44980
-#define errorCallbackOffset				0x44994
-#define nativeFunctionsOffset			0x44998
-#define taskVarsOffset					0x449B0
-#define taskVarsCountOffset				0x459B0
-#define parserTraceEnabledOffset		0x45E6C
-#define currentFilenameOffset			0x45E78
-#define pParseFileInputStreamOffset		0x459D4
-#define errorsCountOffset				0x459DC
-
-struct ScriptLibraryRDll {
-	union {
-		HMODULE hmod;
-		uintptr_t base;
-	};
 	//Exported functions
-	FUNC(pAutoStart, int(__cdecl* AutoStart)());	//Start autostart scripts
-	FUNC(pCodeSize, int(__cdecl* CodeSize)());
-	FUNC(pFindScript, int(__cdecl* FindScript)(int, char* name));
-	FUNC(pGetCurrentScriptType, int(__cdecl* GetCurrentScriptType)());
-	FUNC(pGetFirstRunningTaskId, int(__cdecl* GetFirstRunningTaskId)(int, char* name));
-	FUNC(pGetGlobalVariableValue, float(__cdecl* GetGlobalVariableValue)(int, const char* name));
-	FUNC(pGetHighestRunningTask, int(__cdecl* GetHighestRunningTask)());		//Returns the taskId
-	FUNC(pGetLocalVariableValue, float(__cdecl* GetLocalVariableValue)(int, const char* scriptName, const char* varName));
-	FUNC(pGetNextTask, int(__cdecl* GetNextTask)(int, int taskId));
-	FUNC(pGetPreviousTask, int(__cdecl* GetPreviousTask)(int, int taskId));
-	FUNC(pGetScriptID, int(__cdecl* GetScriptID)());
-	FUNC(pGetScriptInstructionCount, int(__cdecl* GetScriptInstructionCount)());
-	FUNC(pGetScriptType, int(__cdecl* GetScriptType)(int, int taskId));
-	FUNC(pGetTaskFilename, const char* (__cdecl* GetTaskFilename)(int, int scriptIndex));	//WARNING: here task means script
-	FUNC(pGetTaskName, const char* (__cdecl* GetTaskName)(int, int taskId));
-	FUNC(pInitialise, int(__cdecl* Initialise)(int a1, LPVOID pNativeFunctions, ErrorCallback errCallback,
-												NativeCallCallback nativeCallEnterCallback, NativeCallCallback nativeCallExitCallback,
-												int a6, StopTaskCallback stopTaskCallback));
-	FUNC(pLineNumber, int(__cdecl* LineNumber)());
-	FUNC(pLoadBinary, int(__cdecl* LoadBinary)(int a1, const char* FileName));
-	FUNC(pLookIn, int(__cdecl* LookIn)(int, int flag));	//Executes a turn of the task scheduler (should be called each 100 ms)
-	FUNC(pLoopGlobalVariables, int(__cdecl* LoopGlobalVariables)(int, int(__cdecl* callback)(char* name, DWORD type, float value)));
-	FUNC(pLoopTaskVariables, int(__cdecl* LoopTaskVariables)(int, int(__cdecl* callback)(char* name, DWORD type, float value), int taskId));
-	FUNC(pMode, int(__cdecl* Mode)());
-	FUNC(pNumTasks, int(__cdecl* NumTasks)());
-	FUNC(pOpCode, int(__cdecl* OpCode)());
-	FUNC(pOpCodeName, const char* (__cdecl* OpCodeName)(int, int opcode));
-	FUNC(pPOP, float(__cdecl* POP)(DWORD* pType));						//The argument can be NULL
-	FUNC(pPOPI, int(__cdecl* POPI)(DWORD* pType));						//The argument can be NULL
-	FUNC(pPOPU, DWORD(__cdecl* POPU)(DWORD* pType));					//The argument can be NULL
-	FUNC(pPUSH, int(__cdecl* PUSH)(float value, DWORD type));
-	FUNC(pPUSHI, int(__cdecl* PUSHI)(int value, DWORD type));
-	FUNC(pPUSHU, int(__cdecl* PUSHU)(DWORD value, DWORD type));
-	FUNC(pParseFile, int(__cdecl* ParseFile)(int, const char* FileName, const char* directory));
-	FUNC(pParsedFile, int(__cdecl* ParsedFile)(const char* FileName));	//Checks if any script in memory comes from the given file (ignoring path). Returns 0 or 1
-	FUNC(pReboot, int(__cdecl* Reboot)());
-	FUNC(pRestoreState, int(__cdecl* RestoreState)(int a1, const char* FileName));
-	FUNC(pSTRING, const char* (__cdecl* STRING)(int offset));
-	FUNC(pSaveBinary, int(__cdecl* SaveBinary)(int a1, const char* FileName));
-	FUNC(pSaveState, int(__cdecl* SaveState)(int a1, const char* FileName));
-	FUNC(pStartScript, int(__cdecl* StartScript)(int, const char* scriptName, int allowedScriptTypesBitmask));
-	FUNC(pStopAllTasks, int(__cdecl* StopAllTasks)());
-	FUNC(pStopScripts, int(__cdecl* StopScripts)(int, bool(__cdecl* filterFunction)(const char* scriptName, const char* filename)));
-	FUNC(pStopTask, int(__cdecl* StopTask)(int, int taskId));
-	FUNC(pStopTasksOfType, int(__cdecl* StopTasksOfType)(int, int scriptTypesBitmask));
-	FUNC(pTaskFilename, const char* (__cdecl* TaskFilename)());
-	FUNC(pTaskName, const char* (__cdecl* TaskName)());
-	FUNC(pTaskNumber, int(__cdecl* TaskNumber)());
-	FUNC(pType, int(__cdecl* Type)());
-	FUNC(pUnInitialize, int(__cdecl* UnInitialize)());
-	FUNC(pValue, int(__cdecl* Value)());
-	FUNC(pVersion, int(__cdecl* Version)());
+	extern int(__cdecl* AutoStart)();	//Start autostart scripts
+	extern int(__cdecl* CodeSize)();
+	extern int(__cdecl* FindScript)(int, char* name);
+	extern int(__cdecl* GetCurrentScriptType)();
+	extern int(__cdecl* GetFirstRunningTaskId)(int, char* name);
+	extern float(__cdecl* GetGlobalVariableValue)(int, const char* name);
+	extern int(__cdecl* GetHighestRunningTask)();		//Returns the taskId
+	extern float(__cdecl* GetLocalVariableValue)(int, const char* scriptName, const char* varName);
+	extern int(__cdecl* GetNextTask)(int, int taskId);
+	extern int(__cdecl* GetPreviousTask)(int, int taskId);
+	extern int(__cdecl* GetScriptID)();
+	extern int(__cdecl* GetScriptInstructionCount)();
+	extern int(__cdecl* GetScriptType)(int, int taskId);
+	extern const char* (__cdecl* GetTaskFilename)(int, int scriptIndex);	//WARNING: here task means script
+	extern const char* (__cdecl* GetTaskName)(int, int taskId);
+	extern int(__cdecl* Initialise)(int a1, NATIVE_FUNCTION* pNativeFunctions, ErrorCallback errCallback,
+									NativeCallCallback nativeCallEnterCallback, NativeCallCallback nativeCallExitCallback,
+									int a6, StopTaskCallback stopTaskCallback);
+	extern int(__cdecl* LineNumber)();
+	extern int(__cdecl* LoadBinary)(int a1, const char* FileName);
+	extern int(__cdecl* LookIn)(int, int flag);	//Executes a turn of the task scheduler (should be called each 100 ms)
+	extern int(__cdecl* LoopGlobalVariables)(int, int(__cdecl* callback)(char* name, DWORD type, float value));
+	extern int(__cdecl* LoopTaskVariables)(int, int(__cdecl* callback)(char* name, DWORD type, float value), int taskId);
+	extern int(__cdecl* Mode)();
+	extern int(__cdecl* NumTasks)();
+	extern int(__cdecl* OpCode)();
+	extern const char* (__cdecl* OpCodeName)(int, int opcode);
+	extern float(__cdecl* POP)(DWORD* pType);					//The argument can be NULL
+	extern int(__cdecl* POPI)(DWORD* pType);					//The argument can be NULL
+	extern DWORD(__cdecl* POPU)(DWORD* pType);					//The argument can be NULL
+	extern int(__cdecl* PUSH)(float value, DWORD type);
+	extern int(__cdecl* PUSHI)(int value, DWORD type);
+	extern int(__cdecl* PUSHU)(DWORD value, DWORD type);
+	extern int(__cdecl* ParseFile)(int, const char* FileName, const char* directory);
+	extern int(__cdecl* ParsedFile)(const char* FileName);	//Checks if any script in memory comes from the given file (ignoring path). Returns 0 or 1
+	extern int(__cdecl* Reboot)();
+	extern int(__cdecl* RestoreState)(int a1, const char* FileName);
+	extern const char* (__cdecl* STRING)(int offset);
+	extern int(__cdecl* SaveBinary)(int a1, const char* FileName);
+	extern int(__cdecl* SaveState)(int a1, const char* FileName);
+	extern int(__cdecl* StartScript)(int, const char* scriptName, int allowedScriptTypesBitmask);
+	extern int(__cdecl* StopAllTasks)();
+	extern int(__cdecl* StopScripts)(int, bool(__cdecl* filterFunction)(const char* scriptName, const char* filename));
+	extern int(__cdecl* StopTask)(int, int taskId);
+	extern int(__cdecl* StopTasksOfType)(int, int scriptTypesBitmask);
+	extern const char* (__cdecl* TaskFilename)();
+	extern const char* (__cdecl* TaskName)();
+	extern int(__cdecl* TaskNumber)();
+	extern int(__cdecl* Type)();
+	extern int(__cdecl* UnInitialize)();
+	extern int(__cdecl* Value)();
+	extern int(__cdecl* Version)();
 	//Internal functions
-	FUNC(pLoadGameHeaders, char(__cdecl* loadGameHeaders)(const char* gamePath));
-	FUNC(pCreateArray, int(__cdecl* createArray)(const char* name, int datatype, int size, int global));
-	FUNC(pGetVarType, int(__cdecl* getVarType)(int varId));
-	FUNC(pSetVarType, void(__cdecl* setVarType)(int vartype, int varId));
-	FUNC(pCreateVar, int(__cdecl* createVar)(const char* varName, int datatype, const char* scriptName, int global));
-	FUNC(pAddStringToDataSection, size_t(__cdecl* addStringToDataSection)(const char* str));
-	FUNC(pDoStartScript, DWORD(__cdecl* doStartScript)(Script* pScript));
-	FUNC(pStopTask0, int(__cdecl* stopTask0)(Task* pTask));
-	FUNC(pTaskExists, int(__cdecl* taskExists)(int taskNumber));
-	FUNC(pReadTask, Script*(__cdecl* readTask)(Task* pTask, void* pStream));
-	FUNC(pLhvmCpuLoop, char(__cdecl* lhvmCpuLoop)(int a1));
-	FUNC(pAddReference, DWORD(__cdecl* addReference)(DWORD objId));
-	FUNC(pRemoveReference, DWORD(__cdecl* removeReference)(DWORD objId));
-	FUNC(pOpcode_24_CALL, OpcodeImpl opcode_24_CALL);
-	FUNC(pGetExceptionHandlersCount, int(__cdecl* getExceptionHandlersCount)());
-	FUNC(pGetExceptionHandlerCurrentIp, int(__cdecl* getExceptionHandlerCurrentIp)(int exceptionHandlerIndex));
-	FUNC(pParseFileImpl, int(__cdecl* parseFileImpl)());
+	extern char(__cdecl* loadGameHeaders)(const char* gamePath);
+	extern int(__cdecl* createArray)(const char* name, int datatype, int size, int global);
+	extern int(__cdecl* getVarType)(int varId);
+	extern void(__cdecl* setVarType)(int vartype, int varId);
+	extern int(__cdecl* createVar)(const char* varName, int datatype, const char* scriptName, int global);
+	extern size_t(__cdecl* addStringToDataSection)(const char* str);
+	extern DWORD(__cdecl* doStartScript)(Script* pScript);
+	extern int(__cdecl* stopTask0)(Task* pTask);
+	extern int(__cdecl* taskExists)(int taskNumber);
+	extern Script*(__cdecl* readTask)(Task* pTask, void* pStream);
+	extern char(__cdecl* lhvmCpuLoop)(int a1);
+	extern DWORD(__cdecl* addReference)(DWORD objId);
+	extern DWORD(__cdecl* removeReference)(DWORD objId);
+	extern OpcodeImpl opcode_24_CALL;
+	extern int(__cdecl* getExceptionHandlersCount)();
+	extern int(__cdecl* getExceptionHandlerCurrentIp)(int exceptionHandlerIndex);
+	extern int(__cdecl* parseFileImpl)();
 	//Statically linked C-runtime functions
-	FUNC(pOperator_new, LPVOID(__cdecl* operator_new)(size_t size));
-	FUNC(pFree, void(__cdecl* free0)(LPVOID lpMem));
-	FUNC(p_strdup, char*(__cdecl* _strdup)(const char* source));
-	//Internal fields
-	BYTE*				pHeadersNotLoaded;			//0x25618
-	Stack**				ppCurrentStack;				//0x2561C
-	OpcodeImpl*			opcodesImpl;				//0x25624
-	char**				pStrNotCompiled;			//0x25A98
-	UFILE*				pParseFileDefaultInput;		//0x40E38
-	EnumConstantVector* pEnumConstants;				//0x44798
-	InstructionVector*	instructions;				//0x447DC
-	ExceptStruct**		ppCurrentTaskExceptStruct;	//0x447E8
-	Stack*				pMainStack;					//0x447F8
-	TaskList*			pTaskList;					//0x44908
-	AutostartScriptsList* pAutostartScriptsList;	//0x44910
-	VarTypeEntry**		pGlobalVarsDecl;			//0x44920
-	VarVector*			globalVars;					//0x44938
-	ScriptList*			pScriptList;				//0x44958
-	char**				ppDataSection;				//0x44964
-	DWORD*				pDataSectionSize;			//0x44968
-	DWORD*				pTicksCount;				//0x4496C
-	DWORD*				pHighestScriptId;			//0x44974
-	DWORD*				pScriptInstructionCount;	//0x4497C
-	Task**				ppCurrentTask;				//0x44980
-	ErrorCallback*		pErrorCallback;				//0x44994
-	NATIVE_FUNCTION**	ppNativeFunctions;			//0x44998
-	TaskVar*			pTaskVars;					//0x449B0
-	DWORD*				pTaskVarsCount;				//0x459B0
-	DWORD*				pParserTraceEnabled;		//0x45E6C
-	char**				pCurrentFilename;			//0x45E78
-	UFILE**				ppParseFileInputStream;		//0x459D4
-	DWORD**				pErrorsCount;				//0x459DC
-};
+	extern LPVOID(__cdecl* operator_new)(size_t size);
+	extern void(__cdecl* free0)(LPVOID lpMem);
+	extern char*(__cdecl* _strdup)(const char* source);
 
-#undef FUNC
+	//Internal fields
+	extern BYTE* pHeadersNotLoaded;
+	extern Stack** ppCurrentStack;
+	extern OpcodeImpl* opcodesImpl;
+	extern EnumConstantVector* pEnumConstants;
+	extern InstructionVector* instructions;
+	extern ExceptStruct** ppCurrentTaskExceptStruct;
+	extern Stack* pMainStack;
+	extern TaskList* pTaskList;
+	extern AutostartScriptsList* pAutostartScriptsList;
+	extern VarTypeEntry** pGlobalVarsDecl;
+	extern VarVector* globalVars;
+	extern ScriptList* pScriptList;
+	extern char** ppDataSection;
+	extern DWORD* pDataSectionSize;
+	extern DWORD* pTicksCount;
+	extern DWORD* pHighestScriptId;
+	extern DWORD* pScriptInstructionCount;
+	extern Task** ppCurrentTask;
+	extern ErrorCallback* pErrorCallback;
+	extern NATIVE_FUNCTION** ppNativeFunctions;
+	extern TaskVar* pTaskVars;
+	extern DWORD* pTaskVarsCount;
+	extern DWORD* pParserTraceEnabled;
+	extern char** pCurrentFilename;
+	extern UFILE** ppParseFileInputStream;
+	extern DWORD** pErrorsCount;
+#endif
+
+	bool init();
+};
