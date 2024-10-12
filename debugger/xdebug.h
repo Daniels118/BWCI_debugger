@@ -735,7 +735,7 @@ private:
 		} else if (contextId == 1) {
 			std::string items;
 			items.reserve(8192);
-			for (Var* var = ScriptLibraryR.globalVars->pFirst + 1; var < ScriptLibraryR.globalVars->pEnd; var++) {
+			for (Var* var = ScriptLibraryR::globalVars->pFirst + 1; var < ScriptLibraryR::globalVars->pEnd; var++) {
 				if (var->name[0] != '_' && !streq(var->name, "LHVMA")) {
 					std::string item = formatVar(NULL, var, 0, NULL);
 					items += "\n" + item;
@@ -1016,7 +1016,7 @@ private:
 				std::string sType = getTypeName(type);
 				std::string cls = strSnakeToCamel(strReplace(sType, "SCRIPT_OBJECT_TYPE_", ""));
 				if (subtype != 9999) {
-					std::string prefix = subtypesMap[sType] + "_";
+					std::string prefix = ObjectTypes::subtypesMap[sType] + "_";
 					cls += "::" + strSnakeToCamel(strReplace(getSubTypeName(type, subtype), prefix, ""));
 				}
 				item += "classname=\"" + cls + "\" ";
@@ -1053,8 +1053,8 @@ private:
 						|| type == ScriptObjectTypes["SCRIPT_OBJECT_TYPE_DUMB_CREATURE"]
 						|| type == ScriptObjectTypes["SCRIPT_OBJECT_TYPE_FEMALE_CREATURE"];
 		Var var;
-		if (TypeProperties.contains(typeName)) {
-			auto& propNames = TypeProperties[typeName];
+		if (ObjectTypes::TypeProperties.contains(typeName)) {
+			auto& propNames = ObjectTypes::TypeProperties[typeName];
 			for (auto& propName : propNames) {
 				int propVal = ObjectProperties[propName];
 				std::string name = strSnakeToCamel(strReplace(propName, "SCRIPT_OBJECT_PROPERTY_TYPE_", ""));

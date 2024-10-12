@@ -11,6 +11,8 @@
 #include <queue>
 #include <regex>
 
+using namespace DataTypes;
+
 class Display {
 	public:
 		std::string expression;
@@ -262,7 +264,7 @@ class Gdb : public Debugger {
 						printf("\nScript execution interrupted.\n");
 					}
 					printf("\nPaused.\n");
-					if (ScriptLibraryR.pTaskList->count > 0 && !gamePaused) {
+					if (ScriptLibraryR::pTaskList->count > 0 && !gamePaused) {
 						pause = true;
 					} else {
 						readAndExecuteCommand(NULL);
@@ -277,7 +279,7 @@ class Gdb : public Debugger {
 			if (code >= 0) {
 				if (wParam == 0x43 && lParam & 0x80000000 && GetKeyState(VK_CONTROL) & 0x8000) {	//CTRL+C (on keyup)
 					printf("\nPaused.\n");
-					if (ScriptLibraryR.pTaskList->count > 0 && !gamePaused) {
+					if (ScriptLibraryR::pTaskList->count > 0 && !gamePaused) {
 						pause = true;
 					} else {
 						readAndExecuteCommand(NULL);
@@ -302,7 +304,7 @@ class Gdb : public Debugger {
 		}
 
 		static void checkTempScriptEnded() {
-			if (runningCompileCommand && !ScriptLibraryR.taskExists(compiledThreadId)) {
+			if (runningCompileCommand && !ScriptLibraryR::taskExists(compiledThreadId)) {
 				resumeThreadId = 0;
 				allowedThreadId = 0;
 				compiledThreadId = 0;
@@ -589,7 +591,7 @@ class Gdb : public Debugger {
 				} else if (datatype == DT_BOOLEAN) {
 					printf("%s%s%s", prefix, result->floatVal != 0.0f ? "true" : "false", suffix);
 				} else if (datatype == DT_ARRAY || datatype == DT_COORDS) {
-					const int count = getVarSize(currentFrame, result);
+					const int count = datatype == DT_COORDS ? 3 : getVarSize(currentFrame, result);
 					printf("%s{%f", prefix, result->floatVal);
 					result++;
 					for (int i = 1; i < count; i++, result++) {
@@ -777,6 +779,7 @@ class Gdb : public Debugger {
 				breakAfterLines = 0;
 				steppingThread = getThread(currentFrame);
 				stepInMaxDepth = 9999;
+				stepInExceptionHandler = currentFrame->inExceptionHandler;
 				return true;
 			} else {
 				const int count = getTotalInstructions();
@@ -790,6 +793,7 @@ class Gdb : public Debugger {
 						breakAfterLines = 0;
 						steppingThread = getThread(currentFrame);
 						stepInMaxDepth = 9999;
+						stepInExceptionHandler = currentFrame->inExceptionHandler;
 						return true;
 					} else if (instr->opcode == END) {
 						break;
@@ -960,10 +964,10 @@ class Gdb : public Debugger {
 				}
 				//Push parameters on the stack
 				for (int i = 0; i < argc; i++) {
-					ScriptLibraryR.PUSH(params[i], 2);
+					ScriptLibraryR::PUSH(params[i], 2);
 				}
 				//Start the script
-				int taskNumber = ScriptLibraryR.StartScript(NULL, scriptName, 0xFFFFFFFF);
+				int taskNumber = ScriptLibraryR::StartScript(NULL, scriptName, 0xFFFFFFFF);
 				if (taskNumber != 0) {
 					breakAfterLines = 1;
 					steppingThread = getTaskById(taskNumber);
@@ -987,8 +991,8 @@ class Gdb : public Debugger {
 					if (argc > 2) {
 						for (int j = 2; j < argc; j++) {
 							arg = argv[j];
-							for (int i = 0; i < NATIVE_COUNT; i++) {
-								if (_stricmp(arg, NativeFunctionNames[i]) == 0) {
+							for (int i = 0; i < NativeFunctions::NATIVE_COUNT; i++) {
+								if (_stricmp(arg, NativeFunctions::NativeFunctionNames[i]) == 0) {
 									setSyscallCatchpoint(i);
 								}
 							}
@@ -1191,7 +1195,7 @@ class Gdb : public Debugger {
 							setSource("__debugger_compile", lines);
 							resumeThreadId = currentFrame != NULL ? getThread(currentFrame)->taskNumber : 0;
 							runningCompileCommand = true;
-							compiledThreadId = ScriptLibraryR.StartScript(0, "_gdb_expr_", -1);
+							compiledThreadId = ScriptLibraryR::StartScript(0, "_gdb_expr_", -1);
 							allowedThreadId = compiledThreadId;
 							return true;
 						}
@@ -1868,7 +1872,7 @@ class Gdb : public Debugger {
 			//info sources
 			//  list all source files in use
 			std::unordered_set<std::string> printed;
-			ScriptEntry* scriptEntry = ScriptLibraryR.pScriptList->pFirst;
+			ScriptEntry* scriptEntry = ScriptLibraryR::pScriptList->pFirst;
 			while (scriptEntry != NULL) {
 				Script* script = scriptEntry->script;
 				if (!printed.contains(script->filename)) {
@@ -2143,6 +2147,7 @@ class Gdb : public Debugger {
 				breakAfterLines = argc >= 2 ? atoi(argv[1]) : 1;
 				steppingThread = getThread(currentFrame);
 				stepInMaxDepth = getFrameDepth(currentFrame);
+				stepInExceptionHandler = currentFrame->inExceptionHandler;
 				return true;
 			} else {
 				printf("Execution must be paused to step\n");
@@ -2156,6 +2161,7 @@ class Gdb : public Debugger {
 				breakAfterInstructions = argc >= 2 ? atoi(argv[1]) : 1;
 				steppingThread = getThread(currentFrame);
 				stepInMaxDepth = getFrameDepth(currentFrame);
+				stepInExceptionHandler = currentFrame->inExceptionHandler;
 				return true;
 			} else {
 				printf("Execution must be paused to step\n");
@@ -2447,7 +2453,7 @@ class Gdb : public Debugger {
 					}
 					if (var != NULL) {
 						if (var->type == DataTypes::DT_OBJECT) {
-							ScriptLibraryR.removeReference(var->uintVal);
+							ScriptLibraryR::removeReference(var->uintVal);
 						}
 						if (streq(sValue, "true")) {
 							var->type = DataTypes::DT_FLOAT;
@@ -2472,7 +2478,7 @@ class Gdb : public Debugger {
 							}
 						}
 						if (var->type == DataTypes::DT_OBJECT) {
-							ScriptLibraryR.addReference(var->uintVal);
+							ScriptLibraryR::addReference(var->uintVal);
 						}
 					} else {
 						Script* script = getTaskScript(currentFrame);
@@ -2568,6 +2574,7 @@ class Gdb : public Debugger {
 				breakAfterLines = argc >= 2 ? atoi(argv[1]) : 1;
 				steppingThread = getThread(currentFrame);
 				stepInMaxDepth = 9999;
+				stepInExceptionHandler = currentFrame->inExceptionHandler;
 				return true;
 			} else {
 				printf("Execution must be paused to step\n");
@@ -2583,6 +2590,7 @@ class Gdb : public Debugger {
 				breakAfterInstructions = argc >= 2 ? atoi(argv[1]) : 1;
 				steppingThread = getThread(currentFrame);
 				stepInMaxDepth = 9999;
+				stepInExceptionHandler = currentFrame->inExceptionHandler;
 				return true;
 			} else {
 				printf("Execution must be paused to step\n");
@@ -2665,6 +2673,7 @@ class Gdb : public Debugger {
 				breakAfterLines = 0;
 				steppingThread = getThread(currentFrame);
 				stepInMaxDepth = getFrameDepth(currentFrame);
+				stepInExceptionHandler = currentFrame->inExceptionHandler;
 				return true;
 			} else {
 				const int count = getTotalInstructions();
@@ -2678,6 +2687,7 @@ class Gdb : public Debugger {
 						breakAfterLines = 0;
 						steppingThread = getThread(currentFrame);
 						stepInMaxDepth = getFrameDepth(currentFrame);
+						stepInExceptionHandler = currentFrame->inExceptionHandler;
 						return true;
 					} else if (instr->opcode == END) {
 						break;
@@ -2734,10 +2744,10 @@ class Gdb : public Debugger {
 								if (r2 == 1) {
 									//Push parameters on the stack
 									for (auto& param : info.parameters) {
-										ScriptLibraryR.PUSH(param.floatVal, param.type);
+										ScriptLibraryR::PUSH(param.floatVal, param.type);
 									}
 									//Start the script
-									int taskNumber = ScriptLibraryR.StartScript(NULL, info.name.c_str(), 0xFFFFFFFF);
+									int taskNumber = ScriptLibraryR::StartScript(NULL, info.name.c_str(), 0xFFFFFFFF);
 									if (taskNumber == 0) {
 										printf("Failed to start script %s\n", info.name.c_str());
 									}
@@ -2898,7 +2908,7 @@ class Gdb : public Debugger {
 					var += index;
 					for (int i = 0; i < count; i++, varId++, var++) {
 						if (currentFrame == NULL) {
-							if (var >= ScriptLibraryR.globalVars->pEnd) {
+							if (var >= ScriptLibraryR::globalVars->pEnd) {
 								printf("-- no more global vars --\n");
 								break;
 							}

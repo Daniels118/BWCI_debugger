@@ -5,6 +5,8 @@
 #include "debug.h"
 #include "utils.h"
 
+using namespace Opcodes;
+
 std::unordered_map<std::string, Instruction> model;
 std::unordered_map<std::string, int> nativeMap;
 
@@ -13,7 +15,7 @@ void assembler_init() {
 		//Build the mapping between mnemonics and sample instructions
 		for (int iCode = 0; iCode < OPCODES_COUNT; iCode++) {
 			auto& t = opcode_keywords[iCode];
-			for (int mode = 0; mode < 3; mode++) {
+			for (size_t mode = 0; mode < t.size(); mode++) {
 				auto& t2 = t[mode];
 				for (size_t iType = 0; iType < t2.size(); iType++) {
 					std::string keyword = t2[iType];
@@ -30,8 +32,8 @@ void assembler_init() {
 			}
 		}
 		//Build the mapping between native function names and their IDs
-		for (int i = 0; i < NATIVE_COUNT; i++) {
-			nativeMap[NativeFunctionNames[i]] = i;
+		for (int i = 0; i < NativeFunctions::NATIVE_COUNT; i++) {
+			nativeMap[NativeFunctions::NativeFunctionNames[i]] = i;
 		}
 	}
 }
@@ -82,11 +84,11 @@ const char* assemble(Script* script, const int address, const char* str) {
 	if (!model.contains(keyword)) return "unknown instruction";
 	Instruction instr = model[keyword];	//This is safe since it copies the whole struct
 	DWORD attr = opcode_attrs[instr.opcode];
-	if ((attr & OP_ATTR_ARG) == OP_ATTR_ARG || (instr.opcode == Opcodes::CAST && instr.mode == 2)) {
-		if (instr.opcode == Opcodes::POP) {
+	if ((attr & OP_ATTR_ARG) == OP_ATTR_ARG || (instr.opcode == CAST && instr.mode == Modes::REFERENCE)) {
+		if (instr.opcode == POP) {
 			if (operand != NULL) {
 				if (instr.datatype == DataTypes::DT_FLOAT) {
-					instr.mode = 2;
+					instr.mode = Modes::REFERENCE;
 				}
 				char* base = operand;
 				int offset = 0;
@@ -105,7 +107,7 @@ const char* assemble(Script* script, const int address, const char* str) {
 					return "variable not found";
 				}
 			}
-		} else if (instr.opcode == Opcodes::SYS) {
+		} else if (instr.opcode == SYS) {
 			if (operand == NULL) {
 				return "expected native function name";
 			} else if (nativeMap.contains(operand)) {
@@ -113,7 +115,7 @@ const char* assemble(Script* script, const int address, const char* str) {
 			} else {
 				return "unknown native function";
 			}
-		} else if (instr.opcode == Opcodes::SWAP) {
+		} else if (instr.opcode == SWAP) {
 			if (operand != NULL) {
 				if (!isNumber(operand)) {
 					return "expected integer value";
@@ -129,7 +131,7 @@ const char* assemble(Script* script, const int address, const char* str) {
 				int ip = script->instructionAddress + atoi(operand);
 				instr.intVal = ip;
 				if ((attr & OP_ATTR_JUMP) == OP_ATTR_JUMP && ip > address) {
-					instr.mode = 2;
+					instr.mode = Modes::FORWARD;
 				}
 			} else if ((attr & OP_ATTR_SCRIPT) == OP_ATTR_SCRIPT) {
 				Script* targetScript = getScriptByName(operand);
@@ -139,7 +141,7 @@ const char* assemble(Script* script, const int address, const char* str) {
 				operand++;
 				char* p = strchr(operand, ']');
 				if (p == NULL) return "Expected ']'";
-				instr.mode = 2;
+				instr.mode = Modes::REFERENCE;
 				char* base = operand;
 				int offset = 0;
 				char* sOffset = strchr(base, '+');
