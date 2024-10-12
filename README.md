@@ -1,6 +1,6 @@
-# Black & White: Creature Isle scripts debugger
+# Black & White 1 + Creature Isle scripts debugger
 
-This is a project under development which aims to build a debugger for the CHL scripts for the game Black & White: Creature Isle.
+This is a project under development which aims to build a debugger for the _CHL_ scripts for the game _Black & White 1_ and its expansion: _Creature Isle_.
 
 ## Overview
 
