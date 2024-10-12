@@ -1179,6 +1179,7 @@ void debugger_execute_post(Task* task, TaskInfo* info) {
 }
 
 bool checkSuspend(Task* task, TaskInfo* info) {
+	if (!asyncMode) return false;
 	if (info->thread->suspend) {
 		if (!info->thread->suspended) {
 			info->lastStepLine = getCurrentInstruction(task)->linenumber;
