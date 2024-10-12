@@ -16,6 +16,9 @@ The debugger supports the following interfaces:
 - `gdb` text based built-in interface which mimics the popular gdb debugger;
 - `xdebug` (partial support, experimental) general purpose TCP/IP based protocol, mainly used to debug PHP code.
 
+## Installation
+This tool must be loaded using the [mods loader](https://github.com/Daniels118/BW_mods_loader).
+
 ## License
 
 GPL 3
