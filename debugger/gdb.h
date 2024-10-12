@@ -161,6 +161,9 @@ class Gdb : public Debugger {
 				}
 			} else {
 				printf("Thread %i \"%s\" ended\n", info->id, info->name.c_str());
+				if (info->id == resumeThreadId) {
+					resumeThreadId = 0;
+				}
 				if (captureKilledThreads) {
 					killedThreads.push_back(*info);
 				}
@@ -720,6 +723,8 @@ class Gdb : public Debugger {
 				return c_step(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "si") || streq(cmd, "stepi")) {
 				return c_stepi(rawBuffer, argc, cmd);
+			} else if (streq(cmd, "switch") && inScript > 0) {
+				return c_switch(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "tbreak")) {
 				return c_break(rawBuffer, argc, cmd);
 			} else if (streq(cmd, "thread")) {
@@ -1612,7 +1617,7 @@ class Gdb : public Debugger {
 		static bool c_if(char* rawBuffer, int argc, const char* cmd) {
 			if (argc >= 2) {
 				blocks.push_back(BLOCK);
-				char* sCond = rawBuffer + (argv[1] - buffer);
+				const char* sCond = rawBuffer + (argv[1] - buffer);
 				int datatype = DT_BOOLEAN;
 				Script* script = getTaskScript(currentFrame);
 				Expression* cond = getCompiledExpression(script, sCond, datatype);
@@ -1625,16 +1630,71 @@ class Gdb : public Debugger {
 					while (true) {
 						prompt(">");
 						const char* cmd2 = ltrim(buffer);
-						if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+						if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "switch ", 7) == 0 || strncmp(cmd2, "while ", 6) == 0) {
 							depth++;
 						} else if (depth == 1 && streq(cmd2, "else")) {
 							inThen = false;
 							continue;
+						} else if (depth == 1 && strncmp(cmd2, "elseif ", 7) == 0) {
+							if (!inThen) {
+								printf("Unexpected keyword: elseif.\n");
+								break;
+							}
+							sCond = cmd2 + 7;
+							cond = getCompiledExpression(script, sCond, datatype);
+							condRes = evalExpression(currentFrame, cond);
+							condVal = condRes != NULL && condRes->floatVal != 0;
 						} else if (streq(cmd2, "end")) {
 							depth--;
 							if (depth == 0) break;
 						}
 						if (condVal == inThen) {
+							lines.push_back(buffer);
+						}
+					}
+					lines.push_back("end");
+					commandQueue.insert(commandQueue.begin(), lines.begin(), lines.end());
+				}
+			} else {
+				printf("Missing argument.\n");
+			}
+			return false;
+		}
+
+		static bool c_switch(char* rawBuffer, int argc, const char* cmd) {
+			if (argc >= 2) {
+				blocks.push_back(BLOCK);
+				const char* sCond = rawBuffer + (argv[1] - buffer);
+				int datatype = DT_FLOAT;
+				Script* script = getTaskScript(currentFrame);
+				Expression* cond = getCompiledExpression(script, sCond, datatype);
+				if (cond != NULL) {
+					std::list<std::string> lines;
+					const int exprVal = (int) evalExpression(currentFrame, cond)->floatVal;
+					int testVal = 0;
+					bool matches = false;
+					bool done = false;
+					int depth = 1;
+					while (true) {
+						prompt(">");
+						const char* cmd2 = ltrim(buffer);
+						if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "switch ", 7) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+							depth++;
+						} else if (depth == 1 && strncmp(cmd2, "case ", 5) == 0) {
+							done |= matches && !done;
+							sCond = cmd2 + 5;
+							testVal = atoi(sCond);
+							matches = testVal == exprVal && !done;
+							continue;
+						} else if (depth == 1 && streq(cmd2, "default")) {
+							done |= matches && !done;
+							matches = !done;
+							continue;
+						} else if (streq(cmd2, "end")) {
+							depth--;
+							if (depth == 0) break;
+						}
+						if (matches) {
 							lines.push_back(buffer);
 						}
 					}
@@ -2803,7 +2863,7 @@ class Gdb : public Debugger {
 					while (depth > 0) {
 						prompt(">");
 						const char* cmd2 = ltrim(buffer);
-						if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "while ", 6) == 0) {
+						if (strncmp(cmd2, "if ", 3) == 0 || strncmp(cmd2, "switch ", 7) == 0 || strncmp(cmd2, "while ", 6) == 0) {
 							depth++;
 						} else if (streq(cmd2, "end")) {
 							depth--;
